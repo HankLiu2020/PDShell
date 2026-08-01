@@ -52,6 +52,7 @@ tail -f /tmp/fshell/logs/hello-001.log
 ├── running/<id>              # RUNNING：Worker 原子领取后的标记
 ├── done/<id>                 # 成功终态标记
 ├── failed/<id>               # FAILED 或 WORKER_LOST 终态标记
+├── rejected/<id>.ready       # 被拒绝的重复或非法 ready
 ├── logs/<id>.log             # stdout
 ├── logs/<id>.stderr.log      # stderr
 ├── logs/<id>.status          # 给客户端读取的状态快照
@@ -71,6 +72,8 @@ tail -f /tmp/fshell/logs/hello-001.log
 `logs/<id>.status` 只是方便 GUI 读取的快照。使用纯文件协议时，Worker 可能很快领取任务，因此 `.status` 可能从不存在直接变成 `RUNNING`；客户端应通过 `inbox/<id>.ready` 判断 READY，而不能要求一定观察到 `.status=READY`。
 
 GUI 或查询脚本应每次重新读取文件，并按终态优先的顺序推导状态：`done/` → `failed/` → `running/` → `inbox/*.ready` → 未知。
+
+已有终态的重复 `.ready` 和非法任务 ID 会被原子移入 `rejected/`，不会重复执行，也不会永久留在 `inbox/` 反复刷日志。
 
 ### 不使用提交命令
 
@@ -129,12 +132,15 @@ Worker 收到停止信号后会先等待任务进程组退出，约 10 秒后才
 
 已在 x86_64 Linux、Python 3.12、Bash 5.2 和本地 ext4 文件系统的进程模型中动态验证：
 
-- 8 项集成测试全部通过。
+- 11 项集成测试全部通过。
 - 纯文件创建任务在 `.ready` 前不会执行，提交后只执行一次。
 - heartbeat、stdout、stderr、exitcode 和终态标记正确。
 - 人工构造的遗留 RUNNING marker 可转为 WORKER_LOST，随后连续启动 5 次均未重跑。
 - 单 Worker 文件锁、SIGTERM 进程组终止和含空格路径通过。
 - 真实硬杀 Worker 后，任务 Shell 和子进程仍存活；额外终止任务进程组并重建 Worker 后，任务恢复为 WORKER_LOST 且未二次执行。
+- 20 个批量投递的纯文件任务全部串行完成，无失败、重复执行、执行重叠或日志串扰；提交与扫描并发时不保证全局 FIFO 或全局字典序。
+- 任务期间高频读取 heartbeat 319687 次，本地 ext4 上未观察到空文件、半截快照或读取错误。
+- 忽略 SIGTERM 的任务在约 10.131 秒后被 SIGKILL，并正确落盘为 `FAILED/-9`；2 秒停止宽限测试复现了重启后转为 `WORKER_LOST` 的竞争。
 
 进程组硬杀只是对容器 cgroup 销毁的近似，不等价于真实容器测试。当前尚未验证 Docker、PID 1 信号语义、cgroup、bind mount、NFS/CephFS、UID/GID 和 OOM 行为。
 

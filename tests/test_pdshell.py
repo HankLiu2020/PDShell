@@ -121,6 +121,46 @@ class PDShellIntegrationTest(unittest.TestCase):
                 worker.kill()
                 worker.communicate(timeout=3)
 
+    def test_twenty_file_only_jobs_run_once_without_overlap(self):
+        inbox = self.root / "inbox"
+        jobs = self.root / "jobs"
+        inbox.mkdir(parents=True)
+        jobs.mkdir(parents=True)
+        for index in range(20):
+            job_id = f"batch-{index:02d}"
+            job_dir = jobs / job_id
+            job_dir.mkdir()
+            (job_dir / "run.sh").write_text(
+                'mkdir "$PDSHELL_ROOT/active" || { echo "$PDSHELL_JOB_ID" '
+                '>> "$PDSHELL_ROOT/overlap"; exit 91; }\n'
+                'echo "$PDSHELL_JOB_ID" >> "$PDSHELL_ROOT/executions"\n'
+                'echo "$PDSHELL_JOB_ID stdout"\n'
+                'echo "$PDSHELL_JOB_ID stderr" >&2\n'
+                "sleep 0.01\n"
+                'rmdir "$PDSHELL_ROOT/active"\n',
+                encoding="utf-8",
+            )
+            (inbox / f"{job_id}.ready").write_text("READY\n", encoding="utf-8")
+
+        self.run_worker_once()
+
+        executions = (self.root / "executions").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(executions), 20)
+        self.assertEqual(len(set(executions)), 20)
+        self.assertFalse((self.root / "overlap").exists())
+        self.assertEqual(len(list((self.root / "done").iterdir())), 20)
+        self.assertEqual(len(list((self.root / "failed").iterdir())), 0)
+        self.assertEqual(len(list((self.root / "running").iterdir())), 0)
+        self.assertEqual(len(list((self.root / "inbox").glob("*.ready"))), 0)
+        for job_id in executions:
+            self.assertEqual((self.root / "logs" / f"{job_id}.status").read_text(), "SUCCEEDED\n")
+            self.assertEqual((self.root / "logs" / f"{job_id}.exitcode").read_text(), "0\n")
+            self.assertIn(job_id + " stdout", (self.root / "logs" / f"{job_id}.log").read_text())
+            self.assertIn(
+                job_id + " stderr",
+                (self.root / "logs" / f"{job_id}.stderr.log").read_text(),
+            )
+
     def test_script_without_ready_marker_is_not_executed(self):
         job_dir = self.root / "jobs" / "partial-upload"
         job_dir.mkdir(parents=True)
@@ -172,6 +212,49 @@ class PDShellIntegrationTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("任务 ID 已存在", result.stderr)
+
+    def test_duplicate_ready_is_quarantined_once_without_reexecution(self):
+        script = self.write_script(
+            "run-once.sh",
+            'echo "$PDSHELL_JOB_ID" >> "$PDSHELL_ROOT/executions"\n',
+        )
+        self.submit(script, "completed-job")
+        self.run_worker_once()
+
+        duplicate = self.root / "inbox" / "completed-job.ready"
+        duplicate.write_text("READY\n", encoding="utf-8")
+        self.run_worker_once()
+        first_log = (self.root / "worker.log").read_text(encoding="utf-8")
+        self.run_worker_once()
+        second_log = (self.root / "worker.log").read_text(encoding="utf-8")
+
+        self.assertFalse(duplicate.exists())
+        self.assertEqual(
+            (self.root / "rejected" / "completed-job.ready").read_text(encoding="utf-8"),
+            "REJECTED\nreason=TERMINAL_STATE_EXISTS\n",
+        )
+        self.assertEqual((self.root / "executions").read_text(encoding="utf-8"), "completed-job\n")
+        self.assertEqual(first_log.count("拒绝已有终态的重复 ready"), 1)
+        self.assertEqual(second_log.count("拒绝已有终态的重复 ready"), 1)
+
+    def test_invalid_ready_is_quarantined_once(self):
+        inbox = self.root / "inbox"
+        inbox.mkdir(parents=True)
+        invalid = inbox / "invalid job.ready"
+        invalid.write_text("READY\n", encoding="utf-8")
+
+        self.run_worker_once()
+        first_log = (self.root / "worker.log").read_text(encoding="utf-8")
+        self.run_worker_once()
+        second_log = (self.root / "worker.log").read_text(encoding="utf-8")
+
+        self.assertFalse(invalid.exists())
+        self.assertEqual(
+            (self.root / "rejected" / "invalid job.ready").read_text(encoding="utf-8"),
+            "REJECTED\nreason=INVALID_JOB_ID\n",
+        )
+        self.assertEqual(first_log.count("拒绝非法 ready 文件"), 1)
+        self.assertEqual(second_log.count("拒绝非法 ready 文件"), 1)
 
     def test_missing_run_script_fails_instead_of_stopping_worker(self):
         inbox = self.root / "inbox"

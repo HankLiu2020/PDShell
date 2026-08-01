@@ -36,6 +36,7 @@ class Layout:
         self.running = self.root / "running"
         self.done = self.root / "done"
         self.failed = self.root / "failed"
+        self.rejected = self.root / "rejected"
         self.logs = self.root / "logs"
         self.heartbeat = self.root / "heartbeat"
         self.worker_log = self.root / "worker.log"
@@ -49,6 +50,7 @@ class Layout:
             self.running,
             self.done,
             self.failed,
+            self.rejected,
             self.logs,
         ):
             path.mkdir(exist_ok=True)
@@ -213,11 +215,15 @@ class Worker:
         try:
             validate_job_id(job_id)
         except ValueError:
-            self.log(f"忽略非法 ready 文件: {ready.name}")
+            self.reject_ready(ready, "INVALID_JOB_ID", f"拒绝非法 ready 文件: {ready.name}")
             return None
 
         if (self.layout.done / job_id).exists() or (self.layout.failed / job_id).exists():
-            self.log(f"忽略已有终态的重复 ready: {job_id}")
+            self.reject_ready(
+                ready,
+                "TERMINAL_STATE_EXISTS",
+                f"拒绝已有终态的重复 ready: {job_id}",
+            )
             return None
 
         running = self.layout.running / job_id
@@ -229,6 +235,15 @@ class Worker:
         atomic_write(self.layout.status(job_id), "RUNNING\n")
         self.log(f"领取任务 {job_id}")
         return job_id
+
+    def reject_ready(self, ready: Path, reason: str, message: str) -> None:
+        destination = self.layout.rejected / ready.name
+        try:
+            os.replace(ready, destination)
+        except FileNotFoundError:
+            return
+        atomic_write(destination, f"REJECTED\nreason={reason}\n")
+        self.log(message)
 
     def finish(self, job_id: str, exitcode: int) -> None:
         running = self.layout.running / job_id
