@@ -70,6 +70,8 @@ tail -f /tmp/fshell/logs/hello-001.log
 
 `logs/<id>.status` 只是方便 GUI 读取的快照。使用纯文件协议时，Worker 可能很快领取任务，因此 `.status` 可能从不存在直接变成 `RUNNING`；客户端应通过 `inbox/<id>.ready` 判断 READY，而不能要求一定观察到 `.status=READY`。
 
+GUI 或查询脚本应每次重新读取文件，并按终态优先的顺序推导状态：`done/` → `failed/` → `running/` → `inbox/*.ready` → 未知。
+
 ### 不使用提交命令
 
 平台外部可以完全不运行 Python 提交命令，只要严格遵循以下顺序：
@@ -119,17 +121,22 @@ running/<id>
 
 Worker 收到 SIGTERM 或 SIGINT 时，会终止当前任务的整个进程组并将任务记为 `FAILED`。SIGKILL、OOM 或整容器消失时，由下次启动执行 WORKER_LOST 恢复。
 
+重建置换 Worker 之前，平台必须先确认旧容器及其 cgroup 已完全退出。只杀掉 Worker 会释放 `worker.lock`，但已启动的 Shell 和训练子进程可能仍在运行；此时立即启动新 Worker 会破坏单执行者假设。
+
+Worker 收到停止信号后会先等待任务进程组退出，约 10 秒后才升级为 SIGKILL。平台或 Docker 的停止宽限期应明显更长，建议至少 30 秒，否则 Worker 可能来不及写入 `FAILED`，重启后任务将被恢复为 `WORKER_LOST`。
+
 ## 验证状态
 
-已在 x86_64 Linux、Python 3.12、Bash 5.2 的托管执行环境中动态验证：
+已在 x86_64 Linux、Python 3.12、Bash 5.2 和本地 ext4 文件系统的进程模型中动态验证：
 
 - 8 项集成测试全部通过。
 - 纯文件创建任务在 `.ready` 前不会执行，提交后只执行一次。
 - heartbeat、stdout、stderr、exitcode 和终态标记正确。
-- 遗留 RUNNING 转为 WORKER_LOST，随后连续启动 5 次均未重跑。
+- 人工构造的遗留 RUNNING marker 可转为 WORKER_LOST，随后连续启动 5 次均未重跑。
 - 单 Worker 文件锁、SIGTERM 进程组终止和含空格路径通过。
+- 真实硬杀 Worker 后，任务 Shell 和子进程仍存活；额外终止任务进程组并重建 Worker 后，任务恢复为 WORKER_LOST 且未二次执行。
 
-该环境没有 Docker 或 Podman，因此 Docker 构建和 bind mount 仍属于未验证项。
+进程组硬杀只是对容器 cgroup 销毁的近似，不等价于真实容器测试。当前尚未验证 Docker、PID 1 信号语义、cgroup、bind mount、NFS/CephFS、UID/GID 和 OOM 行为。
 
 本地运行测试：
 
@@ -146,5 +153,6 @@ python3 -m unittest discover -s tests -v
 - 已有终态的任务不会因重复 `.ready` 重跑，但重复 marker 会留在 `inbox/`。
 - 文件已执行 `fsync`，但父目录没有 `fsync`，不提供机器掉电级事务保证。
 - `os.replace()` 和 `flock()` 必须在目标 NFS、CIFS、CephFS 或其他共享存储上实测。
+- 进程组终止无法覆盖主动脱离会话的子进程；真实隔离与清理应依赖容器 cgroup。
 - 重定向到文件后，部分程序会缓冲 stdout；训练脚本可使用 `python -u` 或 `PYTHONUNBUFFERED=1`。
 - PDShell 会执行任意 Shell 命令，只应向受信任用户开放共享目录写权限，并尽量使用非 root 用户运行。
