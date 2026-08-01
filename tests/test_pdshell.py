@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,70 @@ class PDShellIntegrationTest(unittest.TestCase):
         self.assertTrue((self.root / "failed" / "failure-job").is_file())
         self.assertEqual((self.root / "logs" / "failure-job.status").read_text(), "FAILED\n")
         self.assertEqual((self.root / "logs" / "failure-job.exitcode").read_text(), "7\n")
+
+    def test_external_client_can_submit_with_files_only(self):
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                str(PDSHELL),
+                "worker",
+                "--root",
+                str(self.root),
+                "--poll-interval",
+                "0.02",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not (self.root / "heartbeat").exists():
+                if time.monotonic() >= deadline:
+                    self.fail("Worker 未在 3 秒内写入 heartbeat")
+                time.sleep(0.02)
+
+            staging_job = self.root / "jobs" / ".file-job.uploading"
+            staging_job.mkdir()
+            (staging_job / "run.sh").write_text(
+                "echo file-protocol-stdout\n"
+                "echo file-protocol-stderr >&2\n"
+                "echo \"$PDSHELL_JOB_ID\" > result.txt\n"
+                "sleep 0.2\n",
+                encoding="utf-8",
+            )
+            os.replace(staging_job, self.root / "jobs" / "file-job")
+
+            staging_ready = self.root / "inbox" / ".file-job.ready.uploading"
+            staging_ready.write_text("READY\n", encoding="utf-8")
+            os.replace(staging_ready, self.root / "inbox" / "file-job.ready")
+
+            saw_running = False
+            deadline = time.monotonic() + 3
+            while not (self.root / "done" / "file-job").exists():
+                status = self.root / "logs" / "file-job.status"
+                if status.exists() and status.read_text(encoding="utf-8") == "RUNNING\n":
+                    saw_running = True
+                if time.monotonic() >= deadline:
+                    self.fail("文件协议任务未在 3 秒内完成")
+                time.sleep(0.02)
+
+            self.assertTrue(saw_running)
+            self.assertEqual((self.root / "logs" / "file-job.status").read_text(), "SUCCEEDED\n")
+            self.assertEqual((self.root / "logs" / "file-job.exitcode").read_text(), "0\n")
+            self.assertIn("file-protocol-stdout", (self.root / "logs" / "file-job.log").read_text())
+            self.assertIn(
+                "file-protocol-stderr",
+                (self.root / "logs" / "file-job.stderr.log").read_text(),
+            )
+            self.assertEqual((self.root / "jobs" / "file-job" / "result.txt").read_text(), "file-job\n")
+        finally:
+            worker.terminate()
+            try:
+                worker.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.communicate(timeout=3)
 
     def test_script_without_ready_marker_is_not_executed(self):
         job_dir = self.root / "jobs" / "partial-upload"
