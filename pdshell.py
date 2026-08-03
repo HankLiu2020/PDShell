@@ -16,57 +16,80 @@ import time
 import uuid
 from pathlib import Path
 
-
-JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+JOB_ID_RE = re.compile(r"^(?!.*\.sh$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RESERVED_JOB_IDS = {
+    "heartbeat",
+    "worker.log",
+    "worker.lock",
+    "inbox",
+    "jobs",
+    "running",
+    "done",
+    "failed",
+    "logs",
+    "rejected",
+}
+LEGACY_LAYOUT_NAMES = {"inbox", "jobs", "running", "done", "failed", "logs", "rejected"}
 
 
 def validate_job_id(job_id: str) -> str:
     if not JOB_ID_RE.fullmatch(job_id):
         raise ValueError(
-            "job id 只能包含字母、数字、点、下划线和短横线，且长度不超过 128"
+            "job id 只能以字母或数字开头，只能包含字母、数字、点、下划线和短横线，"
+            "不能以 .sh 结尾，且长度不超过 128"
         )
+    if job_id in RESERVED_JOB_IDS:
+        raise ValueError(f"job id 保留给 PDShell 控制文件: {job_id}")
     return job_id
 
 
 class Layout:
     def __init__(self, root: Path):
         self.root = root.resolve()
-        self.inbox = self.root / "inbox"
-        self.jobs = self.root / "jobs"
-        self.running = self.root / "running"
-        self.done = self.root / "done"
-        self.failed = self.root / "failed"
-        self.logs = self.root / "logs"
         self.heartbeat = self.root / "heartbeat"
         self.worker_log = self.root / "worker.log"
         self.worker_lock = self.root / "worker.lock"
 
     def create(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        for path in (
-            self.inbox,
-            self.jobs,
-            self.running,
-            self.done,
-            self.failed,
-            self.logs,
-        ):
-            path.mkdir(exist_ok=True)
+        legacy = sorted(name for name in LEGACY_LAYOUT_NAMES if (self.root / name).exists())
+        if legacy:
+            joined = ", ".join(legacy)
+            raise RuntimeError(f"检测到旧版分桶目录: {joined}；请清空或使用新的 tasks 目录")
 
-    def status(self, job_id: str) -> Path:
-        return self.logs / f"{job_id}.status"
+    def job_dir(self, job_id: str) -> Path:
+        return self.root / job_id
 
-    def exitcode(self, job_id: str) -> Path:
-        return self.logs / f"{job_id}.exitcode"
+    def source_script(self, job_id: str) -> Path:
+        return self.root / f"{job_id}.sh"
+
+    def marker(self, job_id: str, state: str) -> Path:
+        return self.job_dir(job_id) / f".{state}"
+
+    def ready(self, job_id: str) -> Path:
+        return self.marker(job_id, "ready")
+
+    def running(self, job_id: str) -> Path:
+        return self.marker(job_id, "running")
+
+    def done(self, job_id: str) -> Path:
+        return self.marker(job_id, "done")
+
+    def failed(self, job_id: str) -> Path:
+        return self.marker(job_id, "failed")
 
     def stdout(self, job_id: str) -> Path:
-        return self.logs / f"{job_id}.log"
+        return self.job_dir(job_id) / "log"
 
     def stderr(self, job_id: str) -> Path:
-        return self.logs / f"{job_id}.stderr.log"
+        return self.job_dir(job_id) / "stderr.log"
+
+    def exitcode(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "exitcode"
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temp.open("w", encoding="utf-8") as handle:
@@ -82,6 +105,15 @@ def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
             pass
 
 
+def copy_file_fsync(source: Path, destination: Path, mode: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        shutil.copyfileobj(source_handle, destination_handle)
+        destination_handle.flush()
+        os.fsync(destination_handle.fileno())
+    os.chmod(destination, mode)
+
+
 def submit(root: Path, script: Path, job_id: str | None = None) -> str:
     layout = Layout(root)
     layout.create()
@@ -92,33 +124,37 @@ def submit(root: Path, script: Path, job_id: str | None = None) -> str:
     if not script.is_file():
         raise FileNotFoundError(f"脚本不存在: {script}")
 
-    job_dir = layout.jobs / job_id
-    markers = [
-        layout.inbox / f"{job_id}.ready",
-        layout.running / job_id,
-        layout.done / job_id,
-        layout.failed / job_id,
-    ]
-    if job_dir.exists() or any(marker.exists() for marker in markers):
+    job_dir = layout.job_dir(job_id)
+    source_copy = layout.source_script(job_id)
+    if job_dir.exists() or source_copy.exists():
         raise FileExistsError(f"任务 ID 已存在: {job_id}")
 
-    temp_dir = layout.jobs / f".{job_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    token = f"{os.getpid()}.{uuid.uuid4().hex}"
+    temp_dir = layout.root / f".{job_id}.{token}.tmp"
+    temp_source = layout.root / f".{job_id}.sh.{token}.tmp"
+    published_dir = False
+    published_source = False
     try:
         temp_dir.mkdir()
-        run_script = temp_dir / "run.sh"
-        with script.open("rb") as source, run_script.open("wb") as target:
-            shutil.copyfileobj(source, target)
-            target.flush()
-            os.fsync(target.fileno())
-        os.chmod(run_script, 0o755)
+        copy_file_fsync(script, temp_dir / "run.sh", 0o755)
+        copy_file_fsync(script, temp_source, 0o644)
+        os.replace(temp_source, source_copy)
+        published_source = True
         os.replace(temp_dir, job_dir)
-
-        ready = layout.inbox / f"{job_id}.ready"
-        atomic_write(ready, f"READY\nsubmitted_at={time.time():.6f}\n")
-        atomic_write(layout.status(job_id), "READY\n")
+        published_dir = True
+        atomic_write(layout.ready(job_id), f"READY\nsubmitted_at={time.time():.6f}\n")
     except Exception:
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
+        if temp_source.exists():
+            temp_source.unlink()
+        if published_dir and not any(job_dir.glob(".*")):
+            shutil.rmtree(job_dir)
+        if published_source and not job_dir.exists():
+            try:
+                source_copy.unlink()
+            except FileNotFoundError:
+                pass
         raise
 
     return job_id
@@ -166,82 +202,82 @@ class Worker:
 
     def recover(self) -> None:
         recovered = 0
-        for marker in sorted(self.layout.running.iterdir()):
+        for marker in sorted(self.layout.root.glob("*/.running")):
             if not marker.is_file():
                 continue
-            job_id = marker.name
-            try:
-                validate_job_id(job_id)
-            except ValueError:
-                self.log(f"忽略非法 running 标记: {marker.name}")
+            job_id = marker.parent.name
+            failed = self.layout.failed(job_id)
+            done = self.layout.done(job_id)
+            if done.exists() or failed.exists():
+                marker.unlink()
+                self.log(f"清理冲突的遗留 running 标记: {job_id}")
                 continue
-
-            atomic_write(marker, "WORKER_LOST\n")
-            os.replace(marker, self.layout.failed / job_id)
-            atomic_write(self.layout.status(job_id), "WORKER_LOST\n")
             atomic_write(self.layout.exitcode(job_id), "-1\n")
+            atomic_write(marker, "WORKER_LOST\n")
+            os.replace(marker, failed)
             self.log(f"恢复任务 {job_id}: RUNNING -> WORKER_LOST")
             recovered += 1
-
-        for ready in sorted(self.layout.inbox.glob("*.ready")):
-            job_id = ready.name[: -len(".ready")]
-            if not JOB_ID_RE.fullmatch(job_id):
-                continue
-            if not (self.layout.done / job_id).exists() and not (self.layout.failed / job_id).exists():
-                atomic_write(self.layout.status(job_id), "READY\n")
-
-        for marker in sorted(self.layout.done.iterdir()):
-            if marker.is_file() and JOB_ID_RE.fullmatch(marker.name):
-                atomic_write(self.layout.status(marker.name), "SUCCEEDED\n")
-
-        for marker in sorted(self.layout.failed.iterdir()):
-            if not marker.is_file() or not JOB_ID_RE.fullmatch(marker.name):
-                continue
-            outcome = marker.read_text(encoding="utf-8").splitlines()[0:1]
-            status = outcome[0] if outcome and outcome[0] in {"FAILED", "WORKER_LOST"} else "FAILED"
-            atomic_write(self.layout.status(marker.name), status + "\n")
-            if status == "WORKER_LOST":
-                atomic_write(self.layout.exitcode(marker.name), "-1\n")
 
         if recovered == 0:
             self.log("启动恢复扫描完成: 没有遗留 RUNNING 任务")
 
+    def consume_duplicate_ready(self, ready: Path, message: str) -> None:
+        try:
+            ready.unlink()
+        except FileNotFoundError:
+            return
+        self.log(message)
+
+    def reject_invalid_ready(self, ready: Path, job_id: str) -> None:
+        failed = ready.parent / ".failed"
+        if failed.exists() or (ready.parent / ".done").exists():
+            self.consume_duplicate_ready(ready, f"清理已有终态的非法 ready: {job_id}")
+            return
+        atomic_write(ready.parent / "stderr.log", f"PDShell 拒绝非法任务 ID: {job_id}\n")
+        atomic_write(ready.parent / "exitcode", "2\n")
+        atomic_write(ready, "FAILED\nreason=INVALID_JOB_ID\n")
+        os.replace(ready, failed)
+        self.log(f"非法 ready 已转为 FAILED: {job_id}")
+
     def claim(self, ready: Path) -> str | None:
-        if not ready.name.endswith(".ready"):
+        if ready.name != ".ready" or not ready.is_file():
             return None
-        job_id = ready.name[: -len(".ready")]
+        job_id = ready.parent.name
         try:
             validate_job_id(job_id)
         except ValueError:
-            self.log(f"忽略非法 ready 文件: {ready.name}")
+            self.reject_invalid_ready(ready, job_id)
             return None
 
-        if (self.layout.done / job_id).exists() or (self.layout.failed / job_id).exists():
-            self.log(f"忽略已有终态的重复 ready: {job_id}")
+        done = self.layout.done(job_id)
+        failed = self.layout.failed(job_id)
+        running = self.layout.running(job_id)
+        if done.exists() or failed.exists():
+            self.consume_duplicate_ready(ready, f"清理已有终态的重复 ready: {job_id}")
+            return None
+        if running.exists():
+            self.consume_duplicate_ready(ready, f"清理已有 RUNNING 的重复 ready: {job_id}")
             return None
 
-        running = self.layout.running / job_id
         try:
             os.replace(ready, running)
         except FileNotFoundError:
             return None
         atomic_write(running, "RUNNING\n")
-        atomic_write(self.layout.status(job_id), "RUNNING\n")
         self.log(f"领取任务 {job_id}")
         return job_id
 
     def finish(self, job_id: str, exitcode: int) -> None:
-        running = self.layout.running / job_id
+        running = self.layout.running(job_id)
         outcome = "SUCCEEDED" if exitcode == 0 else "FAILED"
-        destination = self.layout.done / job_id if exitcode == 0 else self.layout.failed / job_id
+        destination = self.layout.done(job_id) if exitcode == 0 else self.layout.failed(job_id)
         atomic_write(self.layout.exitcode(job_id), f"{exitcode}\n")
         atomic_write(running, outcome + "\n")
         os.replace(running, destination)
-        atomic_write(self.layout.status(job_id), outcome + "\n")
         self.log(f"任务 {job_id} 结束: {outcome}, exitcode={exitcode}")
 
     def execute(self, job_id: str) -> None:
-        job_dir = self.layout.jobs / job_id
+        job_dir = self.layout.job_dir(job_id)
         run_script = job_dir / "run.sh"
         self.current_job = job_id
         self.write_heartbeat()
@@ -286,8 +322,8 @@ class Worker:
                             pass
                     time.sleep(min(self.poll_interval, 1.0))
                 exitcode = int(self.current_process.returncode)
-            except Exception as exc:
-                stderr_handle.write(f"PDShell 无法执行任务: {exc}\n".encode("utf-8"))
+            except (OSError, TypeError, ValueError) as exc:
+                stderr_handle.write(f"PDShell 无法执行任务: {exc}\n".encode())
                 self.log(f"任务 {job_id} 执行异常: {exc!r}")
             finally:
                 self.current_process = None
@@ -311,7 +347,11 @@ class Worker:
         try:
             while not self.stop_requested:
                 self.write_heartbeat()
-                ready_files = sorted(self.layout.inbox.glob("*.ready"))
+                ready_files = sorted(
+                    marker
+                    for marker in self.layout.root.glob("*/.ready")
+                    if marker.is_file()
+                )
                 claimed_any = False
                 for ready in ready_files:
                     job_id = self.claim(ready)
@@ -342,13 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     worker_parser = subparsers.add_parser("worker", help="启动 Worker")
-    worker_parser.add_argument("--root", type=Path, default=Path("/persist/fshell"))
+    worker_parser.add_argument("--root", type=Path, default=Path("/persist/tasks"))
     worker_parser.add_argument("--poll-interval", type=float, default=1.0)
     worker_parser.add_argument("--once", action="store_true", help="处理当前队列后退出")
 
     submit_parser = subparsers.add_parser("submit", help="提交一个 Shell 脚本")
     submit_parser.add_argument("script", type=Path)
-    submit_parser.add_argument("--root", type=Path, default=Path("/persist/fshell"))
+    submit_parser.add_argument("--root", type=Path, default=Path("/persist/tasks"))
     submit_parser.add_argument("--job-id")
     return parser
 
