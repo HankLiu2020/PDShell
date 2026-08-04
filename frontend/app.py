@@ -17,6 +17,18 @@ except ImportError:
     from transport import FileTransport, JobSnapshot, TransportError, make_transport
 
 
+def _default_endpoint() -> str:
+    configured = os.getenv("PDSHELL_ENDPOINT")
+    if configured:
+        return configured
+    host = os.getenv("PDSHELL_SSH_HOST")
+    remote_root = os.getenv("PDSHELL_REMOTE_ROOT")
+    if host and remote_root:
+        user = os.getenv("PDSHELL_SSH_USER")
+        return f"{user + '@' if user else ''}{host}:{remote_root}"
+    return str(Path(__file__).resolve().parents[1] / "tasks")
+
+
 def _format_updated(snapshot: JobSnapshot) -> str:
     if not snapshot.updated_at:
         return "-"
@@ -115,14 +127,23 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
 def main() -> int:
     parser = argparse.ArgumentParser(description="PDShell local Gradio console")
     parser.add_argument("--mode", choices=["local", "rsync", "scp"], default=os.getenv("PDSHELL_TRANSPORT", "local"))
-    parser.add_argument("--endpoint", default=os.getenv("PDSHELL_ENDPOINT", "/persist/tasks"))
+    parser.add_argument("--endpoint", default=_default_endpoint())
+    parser.add_argument("--ssh-port", type=int, default=int(os.getenv("PDSHELL_SSH_PORT", "22")))
     parser.add_argument("--cache", type=Path, default=Path(os.getenv("PDSHELL_CACHE", ".pdshell-cache")))
     parser.add_argument("--poll-interval", type=float, default=float(os.getenv("PDSHELL_POLL_INTERVAL", "2")))
     parser.add_argument("--port", type=int, default=int(os.getenv("PDSHELL_PORT", "7860")))
     args = parser.parse_args()
     if args.poll_interval <= 0:
         parser.error("--poll-interval 必须大于 0")
-    transport = make_transport(args.mode, args.endpoint, args.cache)
+    if args.ssh_port <= 0 or args.ssh_port > 65535:
+        parser.error("--ssh-port 必须介于 1 和 65535")
+    transport = make_transport(
+        args.mode,
+        args.endpoint,
+        args.cache,
+        ssh_port=args.ssh_port,
+        password=os.getenv("PDSHELL_SSH_PASSWORD"),
+    )
     if gr is None:
         print("Gradio 未安装，请执行 pip install -r frontend/requirements.txt", file=sys.stderr)
         return 2

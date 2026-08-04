@@ -2,10 +2,19 @@
 set -euo pipefail
 
 REMOTE=${PDSHELL_REMOTE:-}
+REMOTE_ROOT=${PDSHELL_REMOTE_ROOT:-}
+SSH_HOST=${PDSHELL_SSH_HOST:-}
+SSH_USER=${PDSHELL_SSH_USER:-}
+SSH_PORT=${PDSHELL_SSH_PORT:-22}
+SSH_PASSWORD=${PDSHELL_SSH_PASSWORD:-}
 MODE=${PDSHELL_TRANSPORT:-rsync}
 CACHE=${PDSHELL_CACHE:-${TMPDIR:-/tmp}/pdshell-cache}
 POLL_INTERVAL=${PDSHELL_POLL_INTERVAL:-2}
 MAX_LOG_BYTES=204800
+
+if [[ -z "$REMOTE" && -n "$SSH_HOST" && -n "$REMOTE_ROOT" ]]; then
+    REMOTE=${SSH_USER:+$SSH_USER@}${SSH_HOST}:${REMOTE_ROOT}
+fi
 
 usage() {
     cat <<'EOF'
@@ -18,12 +27,54 @@ usage() {
 
 配置:
   PDSHELL_REMOTE=user@host:/persist/tasks 或本地 tasks 路径
+  或使用 PDSHELL_SSH_HOST / PDSHELL_SSH_USER / PDSHELL_REMOTE_ROOT
+  PDSHELL_SSH_PORT=SSH 端口（默认 22）
+  PDSHELL_SSH_PASSWORD=可选；设置后通过 sshpass -e 读取，不进入命令行
   PDSHELL_TRANSPORT=rsync（默认）或 scp
   PDSHELL_CACHE=本地缓存目录
 EOF
 }
 
 [[ -n "$REMOTE" ]] || { usage >&2; exit 2; }
+[[ "$SSH_PORT" =~ ^[0-9]+$ ]] || { printf '非法 SSH 端口: %s\n' "$SSH_PORT" >&2; exit 2; }
+
+is_remote_endpoint() {
+    [[ "$REMOTE" == *:* ]]
+}
+
+require_sshpass() {
+    [[ -z "$SSH_PASSWORD" ]] && return 0
+    command -v sshpass >/dev/null 2>&1 || {
+        printf '已设置 PDSHELL_SSH_PASSWORD，但系统没有 sshpass\n' >&2
+        return 2
+    }
+}
+
+run_rsync() {
+    local command_args=(rsync)
+    if is_remote_endpoint; then
+        command_args+=(-e "ssh -p $SSH_PORT -o ServerAliveInterval=30")
+    fi
+    if [[ -n "$SSH_PASSWORD" ]]; then
+        require_sshpass
+        SSHPASS=$SSH_PASSWORD sshpass -e "${command_args[@]}" "$@"
+    else
+        "${command_args[@]}" "$@"
+    fi
+}
+
+run_scp() {
+    local command_args=(scp)
+    if is_remote_endpoint; then
+        command_args+=(-P "$SSH_PORT")
+    fi
+    if [[ -n "$SSH_PASSWORD" ]]; then
+        require_sshpass
+        SSHPASS=$SSH_PASSWORD sshpass -e "${command_args[@]}" "$@"
+    else
+        "${command_args[@]}" "$@"
+    fi
+}
 
 remote_path() {
     printf '%s/%s' "${REMOTE%/}" "$1"
@@ -43,7 +94,7 @@ validate_job_id() {
 sync_metadata() {
     mkdir -p "$CACHE"
     if [[ "$MODE" == "rsync" ]]; then
-        rsync -a \
+        run_rsync -a \
             --include='*/' \
             --include='heartbeat' \
             --include='.ready' \
@@ -54,7 +105,7 @@ sync_metadata() {
             --exclude='*' \
             "$(remote_path '')" "$CACHE/"
     elif [[ "$MODE" == "scp" ]]; then
-        scp -q -r "$(remote_path '.')" "$CACHE"
+        run_scp -q -r "$(remote_path '.')" "$CACHE"
     else
         printf '不支持的传输模式: %s\n' "$MODE" >&2
         return 2
@@ -67,10 +118,10 @@ sync_job() {
     if [[ "$MODE" == "rsync" ]]; then
         local name
         for name in .ready .running .done .failed exitcode log stderr.log; do
-            rsync -a "$(remote_path "$job_id/$name")" "$CACHE/$job_id/$name" 2>/dev/null || true
+            run_rsync -a "$(remote_path "$job_id/$name")" "$CACHE/$job_id/$name" 2>/dev/null || true
         done
     else
-        scp -q -r "$(remote_path "$job_id/.")" "$CACHE/$job_id" 2>/dev/null || true
+        run_scp -q -r "$(remote_path "$job_id/.")" "$CACHE/$job_id" 2>/dev/null || true
     fi
 }
 
@@ -111,11 +162,11 @@ submit() {
     trap 'rm -rf "$staging"' RETURN
     cp "$script" "$staging/run.sh"
     chmod 755 "$staging/run.sh"
-    printf 'READY\nsubmitted_at=%s\n' "$(date +%s.%N)" > "$staging/.ready"
+    printf 'READY\nsubmitted_at=%s\n' "$(date +%s)" > "$staging/.ready"
 
-    rsync -a "$script" "$(remote_path "$job_id.sh")"
-    rsync -a "$staging/" "$(remote_path "$job_id/")"
-    rsync -a "$staging/.ready" "$(remote_path "$job_id/.ready")"
+    run_rsync -a "$script" "$(remote_path "$job_id.sh")"
+    run_rsync -a --exclude='.ready' "$staging/" "$(remote_path "$job_id/")"
+    run_rsync -a "$staging/.ready" "$(remote_path "$job_id/.ready")"
     printf '%s\n' "$job_id"
 }
 

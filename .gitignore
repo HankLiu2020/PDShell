@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .pdshell-cache/
+.ruff_cache/
+.last_sync_target
+.env
+tasks/

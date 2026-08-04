@@ -8,6 +8,7 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PDSHELL = PROJECT_DIR / "pdshell.py"
+ENTRYPOINT = PROJECT_DIR / "docker-entrypoint.sh"
 STATES = (".ready", ".running", ".done", ".failed")
 
 
@@ -233,6 +234,46 @@ class PDShellIntegrationTest(unittest.TestCase):
                 "submit", str(script), "--root", str(self.root), "--job-id", job_id, check=False
             )
             self.assertEqual(result.returncode, 2)
+
+    def test_environment_root_is_used_without_cli_root_argument(self):
+        script = self.write_script("environment-root.sh", "true\n")
+        environment_root = Path(self.temp_dir.name) / "environment-tasks"
+        result = subprocess.run(
+            [sys.executable, str(PDSHELL), "submit", str(script), "--job-id", "environment-job"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ | {"PDSHELL_ROOT": str(environment_root)},
+        )
+        self.assertEqual(result.stdout.strip(), "environment-job")
+        self.assertTrue((environment_root / "environment-job" / ".ready").is_file())
+
+    def test_entrypoint_finds_worker_from_an_arbitrary_working_directory(self):
+        entrypoint_root = Path(self.temp_dir.name) / "entrypoint-tasks"
+        working_directory = Path(self.temp_dir.name) / "other-directory"
+        working_directory.mkdir()
+        worker = subprocess.Popen(
+            [str(ENTRYPOINT)],
+            cwd=working_directory,
+            env=os.environ
+            | {
+                "PDSHELL_ROOT": str(entrypoint_root),
+                "PDSHELL_POLL_INTERVAL": "0.05",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not (entrypoint_root / "heartbeat").exists():
+                if time.monotonic() >= deadline:
+                    self.fail("入口脚本未在 3 秒内启动 Worker")
+                time.sleep(0.02)
+        finally:
+            worker.terminate()
+            worker.communicate(timeout=3)
+        self.assertEqual(worker.returncode, 0)
 
     def test_legacy_layout_is_rejected(self):
         (self.root / "inbox").mkdir(parents=True)

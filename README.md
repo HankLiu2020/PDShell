@@ -6,10 +6,10 @@ PDShell（Persistent Directory Shell）把一个没有 SSH 或交互终端的长
 
 ## v2 目录协议
 
-默认根目录为 `/persist/tasks`。每个任务只使用自己的文件夹，状态切换全部发生在同一目录内：
+服务器直接运行时，默认根目录是 PDShell 脚本所在目录旁的 `tasks/`；Docker 示例通过环境变量使用 `/persist/tasks`。每个任务只使用自己的文件夹，状态切换全部发生在同一目录内：
 
 ```text
-/persist/tasks/
+$PDSHELL_ROOT/
 ├── <id>.sh                  # 外部脚本的只读审计副本，可选
 ├── <id>/
 │   ├── run.sh               # 完整落盘后执行的脚本副本
@@ -37,10 +37,12 @@ PDShell（Persistent Directory Shell）把一个没有 SSH 或交互终端的长
 ## Worker
 
 ```bash
-python3 pdshell.py worker --root /tmp/tasks
+bash docker-entrypoint.sh
 ```
 
-Worker 启动时会拒绝检测到的旧版 `inbox/jobs/running/done/failed/logs/rejected` 分桶，避免把旧数据静默当成新协议。新部署请使用空的 `/persist/tasks`。
+`docker-entrypoint.sh` 会从任意当前工作目录定位自身和 `pdshell.py`，默认把任务写入脚本旁的 `tasks/`。`python3 pdshell.py worker` 和 `submit` 使用同一默认值；`PDSHELL_ROOT` 或显式 `--root` 均可覆盖。
+
+Worker 启动时会拒绝检测到的旧版 `inbox/jobs/running/done/failed/logs/rejected` 分桶，避免把旧数据静默当成新协议。新部署请使用新的空任务根目录。
 
 提交命令会复制脚本并在最后创建 ready：
 
@@ -86,6 +88,7 @@ Worker 只执行 `<id>/run.sh`；根目录 `<id>.sh` 仅供审计和下载，不
 ```bash
 export PDSHELL_REMOTE=user@host:/persist/tasks
 export PDSHELL_TRANSPORT=rsync
+export PDSHELL_SSH_PORT=22
 
 ./pdshell_client.sh submit train.sh train-003
 ./pdshell_client.sh list
@@ -95,6 +98,32 @@ export PDSHELL_TRANSPORT=rsync
 ```
 
 rsync 模式按“审计脚本 → `run.sh` → `.ready`”顺序上传，并依赖 rsync 接收端临时文件加 rename。scp 模式是只读监控模式；提交按钮和 `submit` 命令会被禁用。当前 scp 模式为兼容性实现，会拉取远端任务目录，适合小规模监控；任务较多或日志较大时应使用 rsync。客户端使用本地缓存，不在仓库或界面保存 SSH 密码。
+
+也可以把连接拆成环境变量，适配非 22 端口：
+
+```bash
+export PDSHELL_SSH_HOST=cluster.example
+export PDSHELL_SSH_USER=user
+export PDSHELL_SSH_PORT=30901
+export PDSHELL_REMOTE_ROOT=/path/to/PDShell/tasks
+
+# 仅在无法使用 SSH key 时设置；要求本机安装 sshpass。
+export PDSHELL_SSH_PASSWORD='从安全环境注入，不要写进脚本或 Git'
+```
+
+密码使用 `sshpass -e` 从进程环境读取，不出现在命令参数中。优先使用 SSH key；`.env` 已加入 `.gitignore`，但仍不应把凭据保存在项目目录。
+
+## 同步到服务器
+
+`sync_to_server.sh` 可把工程同步到普通 Linux 服务器，同时排除 `.git/`、`tasks/`、缓存、`.env` 和同步记录：
+
+```bash
+export PDSHELL_DEPLOY_TARGET=user@host:/path/to/PDShell
+export PDSHELL_SSH_PORT=30901
+./sync_to_server.sh
+```
+
+同步后脚本会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
 
 ## Gradio 控制台
 
@@ -113,8 +142,11 @@ rsync 模式：
 python3 frontend/app.py \
   --mode rsync \
   --endpoint user@host:/persist/tasks \
+  --ssh-port 30901 \
   --cache ~/.cache/pdshell
 ```
+
+Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可选 `PDSHELL_SSH_PASSWORD`。不传 `--endpoint` 时，本地模式默认使用仓库旁的 `tasks/`。
 
 控制台每 2 秒刷新 heartbeat 和任务 marker，选中任务后同步日志；界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
 
@@ -133,20 +165,24 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 
 ## 验证状态
 
-当前本地动态验证包含 18 项测试，覆盖：
+当前本地动态验证包含 24 项测试，覆盖：
 
 - v2 任务目录成功/失败闭环、纯文件提交、20 个批量任务串行执行。
 - 单 marker、审计副本、缺脚本、重复 ID、非法 ID、旧布局拒绝。
 - `.ready` 重复消费、`.running` 恢复为 `WORKER_LOST`、SIGTERM 进程组终止和单 Worker 锁。
 - rsync 本地提交与缓存同步、scp 只读限制、日志尾部截断和 Shell 客户端闭环。
+- 非 22 SSH 端口、sshpass 参数脱敏、任意工作目录入口启动和环境变量默认根目录。
+- 工程同步排除运行数据、脚本执行权限和全仓库 LF 行尾检查。
 
 运行测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile pdshell.py frontend/transport.py frontend/app.py
-bash -n pdshell_client.sh
+bash -n docker-entrypoint.sh pdshell_client.sh sync_to_server.sh
 ```
+
+仓库通过 `.gitattributes` 强制 Python、Shell、Markdown 和 Dockerfile 使用 LF，避免 Windows/IDE 的 CRLF 转换制造整文件伪 diff。
 
 当前仍未验证真实 Docker/PID 1 生命周期、目标 NFS/CephFS、多节点缓存、UID/GID、OOM 和平台停止重建行为。
 

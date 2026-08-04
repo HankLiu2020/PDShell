@@ -166,15 +166,27 @@ class LocalTransport(FileTransport):
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
-def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=True, capture_output=True, text=True)
+def _is_remote_endpoint(endpoint: str) -> bool:
+    return ":" in endpoint
 
 
 class RsyncTransport(FileTransport):
-    def __init__(self, remote: str, cache: Path, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        remote: str,
+        cache: Path,
+        runner: CommandRunner | None = None,
+        ssh_port: int = 22,
+        password: str | None = None,
+    ):
         self.remote = remote.rstrip("/")
         self._cache = cache.expanduser().resolve()
-        self.runner = runner or _default_runner
+        self.runner = runner
+        self.ssh_port = ssh_port
+        self.environment = os.environ.copy()
+        if password:
+            self.environment["SSHPASS"] = password
+        self.password_enabled = bool(password)
 
     def root(self) -> Path:
         return self._cache
@@ -182,16 +194,32 @@ class RsyncTransport(FileTransport):
     def _remote(self, relative: str = "") -> str:
         return f"{self.remote}/{relative}" if relative else f"{self.remote}/"
 
+    def _rsync_command(self) -> list[str]:
+        command = ["rsync"]
+        if _is_remote_endpoint(self.remote):
+            command.extend(["-e", f"ssh -p {self.ssh_port} -o ServerAliveInterval=30"])
+        if self.password_enabled:
+            command = ["sshpass", "-e", *command]
+        return command
+
     def _run(self, args: Sequence[str]) -> None:
         try:
-            self.runner(args)
+            if self.runner is not None:
+                self.runner(args)
+            else:
+                subprocess.run(
+                    args,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=self.environment,
+                )
         except (OSError, subprocess.CalledProcessError) as exc:
             raise TransportError(f"传输失败: {' '.join(args)}") from exc
 
     def sync_metadata(self) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
-        args = [
-            "rsync",
+        args = self._rsync_command() + [
             "-a",
             "--include=*/",
             "--include=heartbeat",
@@ -212,7 +240,10 @@ class RsyncTransport(FileTransport):
         destination.mkdir(parents=True, exist_ok=True)
         for name in (".ready", ".running", ".done", ".failed", "exitcode", "log", "stderr.log"):
             try:
-                self._run(["rsync", "-a", self._remote(f"{job_id}/{name}"), str(destination / name)])
+                self._run(
+                    self._rsync_command()
+                    + ["-a", self._remote(f"{job_id}/{name}"), str(destination / name)]
+                )
             except TransportError:
                 continue
 
@@ -227,27 +258,69 @@ class RsyncTransport(FileTransport):
             shutil.copyfile(script, staging / "run.sh")
             ready = staging / ".ready"
             ready.write_text(f"READY\nsubmitted_at={time.time():.6f}\n", encoding="utf-8")
-            self._run(["rsync", "-a", str(script), self._remote(f"{job_id}.sh")])
-            self._run(["rsync", "-a", str(staging) + "/", self._remote(f"{job_id}/")])
-            self._run(["rsync", "-a", str(ready), self._remote(f"{job_id}/.ready")])
+            self._run(self._rsync_command() + ["-a", str(script), self._remote(f"{job_id}.sh")])
+            self._run(
+                self._rsync_command()
+                + [
+                    "-a",
+                    "--exclude=.ready",
+                    str(staging) + "/",
+                    self._remote(f"{job_id}/"),
+                ]
+            )
+            self._run(
+                self._rsync_command() + ["-a", str(ready), self._remote(f"{job_id}/.ready")]
+            )
         return job_id
 
 
 class ScpTransport(FileTransport):
     read_only = True
 
-    def __init__(self, remote: str, cache: Path, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        remote: str,
+        cache: Path,
+        runner: CommandRunner | None = None,
+        ssh_port: int = 22,
+        password: str | None = None,
+    ):
         self.remote = remote.rstrip("/")
         self._cache = cache.expanduser().resolve()
-        self.runner = runner or _default_runner
+        self.runner = runner
+        self.ssh_port = ssh_port
+        self.environment = os.environ.copy()
+        if password:
+            self.environment["SSHPASS"] = password
+        self.password_enabled = bool(password)
 
     def root(self) -> Path:
         return self._cache
 
+    def _scp_command(self) -> list[str]:
+        command = ["scp"]
+        if _is_remote_endpoint(self.remote):
+            command.extend(["-P", str(self.ssh_port)])
+        if self.password_enabled:
+            command = ["sshpass", "-e", *command]
+        return command
+
+    def _run(self, args: Sequence[str]) -> None:
+        if self.runner is not None:
+            self.runner(args)
+        else:
+            subprocess.run(
+                args,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=self.environment,
+            )
+
     def sync_metadata(self) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
         try:
-            self.runner(["scp", "-q", "-r", f"{self.remote}/.", str(self._cache)])
+            self._run(self._scp_command() + ["-q", "-r", f"{self.remote}/.", str(self._cache)])
         except (OSError, subprocess.CalledProcessError) as exc:
             raise TransportError("读取 scp 目录失败；请改用 rsync 或确认远端路径") from exc
 
@@ -255,7 +328,10 @@ class ScpTransport(FileTransport):
         destination = self._cache / job_id
         destination.mkdir(parents=True, exist_ok=True)
         try:
-            self.runner(["scp", "-q", "-r", f"{self.remote}/{job_id}/.", str(destination)])
+            self._run(
+                self._scp_command()
+                + ["-q", "-r", f"{self.remote}/{job_id}/.", str(destination)]
+            )
         except (OSError, subprocess.CalledProcessError):
             return
 
@@ -263,11 +339,17 @@ class ScpTransport(FileTransport):
         raise TransportError("scp 模式只读，请切换为 rsync 后提交任务")
 
 
-def make_transport(mode: str, endpoint: str, cache: Path) -> FileTransport:
+def make_transport(
+    mode: str,
+    endpoint: str,
+    cache: Path,
+    ssh_port: int = 22,
+    password: str | None = None,
+) -> FileTransport:
     if mode == "local":
         return LocalTransport(Path(endpoint))
     if mode == "rsync":
-        return RsyncTransport(endpoint, cache)
+        return RsyncTransport(endpoint, cache, ssh_port=ssh_port, password=password)
     if mode == "scp":
-        return ScpTransport(endpoint, cache)
+        return ScpTransport(endpoint, cache, ssh_port=ssh_port, password=password)
     raise ValueError(f"不支持的传输模式: {mode}")

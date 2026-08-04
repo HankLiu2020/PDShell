@@ -30,6 +30,8 @@ RESERVED_JOB_IDS = {
     "rejected",
 }
 LEGACY_LAYOUT_NAMES = {"inbox", "jobs", "running", "done", "failed", "logs", "rejected"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_ROOT = Path(os.environ.get("PDSHELL_ROOT", SCRIPT_DIR / "tasks"))
 
 
 def validate_job_id(job_id: str) -> str:
@@ -382,13 +384,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     worker_parser = subparsers.add_parser("worker", help="启动 Worker")
-    worker_parser.add_argument("--root", type=Path, default=Path("/persist/tasks"))
+    worker_parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     worker_parser.add_argument("--poll-interval", type=float, default=1.0)
     worker_parser.add_argument("--once", action="store_true", help="处理当前队列后退出")
 
     submit_parser = subparsers.add_parser("submit", help="提交一个 Shell 脚本")
     submit_parser.add_argument("script", type=Path)
-    submit_parser.add_argument("--root", type=Path, default=Path("/persist/tasks"))
+    submit_parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     submit_parser.add_argument("--job-id")
     return parser
 

@@ -4,5 +4,6 @@ WORKDIR /opt/pdshell
 COPY pdshell.py docker-entrypoint.sh ./
 RUN chmod +x /opt/pdshell/docker-entrypoint.sh
 
+ENV PDSHELL_ROOT=/persist/tasks
 VOLUME ["/persist"]
 ENTRYPOINT ["/opt/pdshell/docker-entrypoint.sh"]
