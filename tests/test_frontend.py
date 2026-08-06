@@ -84,6 +84,8 @@ class FrontendTransportTest(unittest.TestCase):
 
         def runner(args):
             calls.append(list(args))
+            if "--list-only" in args:
+                return subprocess.CompletedProcess(args, 0, "drwx------ 1 .\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         transport = RsyncTransport(
@@ -102,6 +104,41 @@ class FrontendTransportTest(unittest.TestCase):
         transport.submit_script(self.write_script(), "ordered-ready")
         self.assertIn("--exclude=.ready", calls[-2])
         self.assertTrue(calls[-1][-1].endswith("/ordered-ready/.ready"))
+
+    def test_rsync_transport_rejects_every_existing_job_shape(self):
+        for existing in ("ready", "running", "done", "failed", "incomplete", "audit"):
+            with self.subTest(existing=existing):
+                remote = self.base / existing
+                remote.mkdir()
+                if existing == "audit":
+                    (remote / "same-id.sh").write_text("old audit\n", encoding="utf-8")
+                else:
+                    job_dir = remote / "same-id"
+                    job_dir.mkdir()
+                    (job_dir / "run.sh").write_text("old script\n", encoding="utf-8")
+                    if existing in {"ready", "running", "done", "failed"}:
+                        (job_dir / f".{existing}").write_text(existing.upper() + "\n", encoding="utf-8")
+
+                transport = RsyncTransport(str(remote), self.base / f"cache-{existing}")
+                with self.assertRaisesRegex(TransportError, "任务 ID 已存在"):
+                    transport.submit_script(self.write_script("echo replacement\n"), "same-id")
+
+    def test_rsync_transport_does_not_treat_probe_errors_as_missing(self):
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 12, "", "protocol error")
+
+        transport = RsyncTransport(
+            "user@example:/persist/tasks",
+            self.base / "cache",
+            runner=runner,
+        )
+        with self.assertRaisesRegex(TransportError, "预检失败"):
+            transport.submit_script(self.write_script(), "probe-error")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--list-only", calls[0])
 
     def test_rsync_transport_reuses_worker_job_id_validation(self):
         transport = RsyncTransport(str(self.base / "remote"), self.base / "cache")
@@ -155,6 +192,20 @@ class ShellClientTest(unittest.TestCase):
             env=environment,
         )
         self.assertEqual(submitted.stdout.strip(), "client-job")
+
+        replacement = self.base / "replacement.sh"
+        replacement.write_text("echo replacement-output\n", encoding="utf-8")
+        duplicate = subprocess.run(
+            [str(CLIENT), "submit", str(replacement), "client-job"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn("任务 ID 已存在", duplicate.stderr)
+        self.assertIn("client-output", (remote / "client-job" / "run.sh").read_text())
+
         subprocess.run(
             [sys.executable, str(PDSHELL), "worker", "--root", str(remote), "--once"],
             check=True,
@@ -177,6 +228,29 @@ class ShellClientTest(unittest.TestCase):
             env=environment,
         )
         self.assertIn("client-output", logs.stdout)
+
+    def test_shell_client_rejects_incomplete_remote_job(self):
+        remote = self.base / "tasks"
+        incomplete = remote / "partial-job"
+        incomplete.mkdir(parents=True)
+        (incomplete / "run.sh").write_text("echo original\n", encoding="utf-8")
+        replacement = self.base / "replacement.sh"
+        replacement.write_text("echo replacement\n", encoding="utf-8")
+        result = subprocess.run(
+            [str(CLIENT), "submit", str(replacement), "partial-job"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=os.environ
+            | {
+                "PDSHELL_REMOTE": str(remote),
+                "PDSHELL_TRANSPORT": "rsync",
+                "PDSHELL_CACHE": str(self.base / "cache"),
+            },
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("任务 ID 已存在", result.stderr)
+        self.assertEqual((incomplete / "run.sh").read_text(), "echo original\n")
 
     def test_project_sync_excludes_runtime_and_repository_data(self):
         destination = self.base / "deployed"
