@@ -217,6 +217,39 @@ class RsyncTransport(FileTransport):
         except (OSError, subprocess.CalledProcessError) as exc:
             raise TransportError(f"传输失败: {' '.join(args)}") from exc
 
+    def _job_exists(self, job_id: str) -> bool:
+        args = self._rsync_command() + [
+            "--list-only",
+            f"--include=/{job_id}/",
+            f"--include=/{job_id}.sh",
+            "--exclude=*",
+            self._remote(),
+        ]
+        try:
+            if self.runner is not None:
+                result = self.runner(args)
+            else:
+                result = subprocess.run(
+                    args,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=self.environment,
+                )
+        except subprocess.CalledProcessError as exc:
+            result = subprocess.CompletedProcess(args, exc.returncode, exc.stdout, exc.stderr)
+        except OSError as exc:
+            raise TransportError(f"远端任务预检失败: {' '.join(args)}") from exc
+        if result.returncode != 0:
+            raise TransportError(f"远端任务预检失败，rsync exitcode={result.returncode}")
+        expected_names = {job_id, f"{job_id}.sh"}
+        listed_names = {
+            line.rsplit(maxsplit=1)[-1]
+            for line in result.stdout.splitlines()
+            if line.split()
+        }
+        return bool(expected_names & listed_names)
+
     def sync_metadata(self) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
         args = self._rsync_command() + [
@@ -253,6 +286,8 @@ class RsyncTransport(FileTransport):
         validate_job_id(job_id)
         if not script.is_file():
             raise FileNotFoundError(f"脚本不存在: {script}")
+        if self._job_exists(job_id):
+            raise TransportError(f"任务 ID 已存在，拒绝重复提交: {job_id}")
         with tempfile.TemporaryDirectory(prefix="pdshell-submit-") as temporary:
             staging = Path(temporary)
             shutil.copyfile(script, staging / "run.sh")

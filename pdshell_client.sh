@@ -80,6 +80,32 @@ remote_path() {
     printf '%s/%s' "${REMOTE%/}" "$1"
 }
 
+remote_job_exists() {
+    local job_id=$1
+    local listing
+    local exitcode
+    if listing=$(run_rsync \
+        --list-only \
+        --include="/$job_id/" \
+        --include="/$job_id.sh" \
+        --exclude='*' \
+        "$(remote_path '')" 2>&1); then
+        :
+    else
+        exitcode=$?
+        printf '远端任务预检失败，rsync exitcode=%s\n' "$exitcode" >&2
+        return 2
+    fi
+    local line listed_name
+    while IFS= read -r line; do
+        listed_name=${line##* }
+        if [[ "$listed_name" == "$job_id" || "$listed_name" == "$job_id.sh" ]]; then
+            return 0
+        fi
+    done <<< "$listing"
+    return 1
+}
+
 validate_job_id() {
     local job_id=$1
     [[ "$job_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
@@ -156,6 +182,15 @@ submit() {
     local job_id=${2:-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}}
     [[ -f "$script" ]] || { printf '脚本不存在: %s\n' "$script" >&2; exit 2; }
     validate_job_id "$job_id" || { printf '非法任务 ID: %s\n' "$job_id" >&2; exit 2; }
+
+    local precheck_exitcode
+    if remote_job_exists "$job_id"; then
+        printf '任务 ID 已存在，拒绝重复提交: %s\n' "$job_id" >&2
+        exit 2
+    else
+        precheck_exitcode=$?
+    fi
+    [[ "$precheck_exitcode" -eq 1 ]] || exit "$precheck_exitcode"
 
     local staging
     staging=$(mktemp -d "${TMPDIR:-/tmp}/pdshell-submit.XXXXXX")
