@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 000
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PDSHELL_ROOT=${PDSHELL_ROOT:-"$SCRIPT_DIR/tasks"}

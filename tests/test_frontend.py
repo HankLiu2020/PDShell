@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from frontend.transport import (
     TransportError,
     list_snapshots,
     tail_text,
+    worker_summary,
 )
 
 
@@ -98,12 +100,25 @@ class FrontendTransportTest(unittest.TestCase):
         transport.sync_metadata()
         command = calls[0]
         self.assertEqual(command[:3], ["sshpass", "-e", "rsync"])
-        self.assertIn("ssh -p 30901 -o ServerAliveInterval=30", command)
+        self.assertIn(
+            "ssh -p 30901 -o ServerAliveInterval=30 -o ControlMaster=auto "
+            "-o ControlPersist=60 -o ControlPath=~/.ssh/pdshell-%C",
+            command,
+        )
+        self.assertIn("--no-times", command)
         self.assertNotIn("not-on-command-line", command)
 
         transport.submit_script(self.write_script(), "ordered-ready")
         self.assertIn("--exclude=.ready", calls[-2])
         self.assertTrue(calls[-1][-1].endswith("/ordered-ready/.ready"))
+        for command in calls[-3:]:
+            self.assertIn("--chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw", command)
+
+        calls.clear()
+        transport.sync_job("ordered-ready")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--include=log", calls[0])
+        self.assertIn("--include=stderr.log", calls[0])
 
     def test_rsync_transport_rejects_every_existing_job_shape(self):
         for existing in ("ready", "running", "done", "failed", "incomplete", "audit"):
@@ -158,6 +173,23 @@ class FrontendTransportTest(unittest.TestCase):
             ("done-job", "SUCCEEDED"),
             ("partial-job", "INCOMPLETE"),
         ])
+
+    def test_worker_summary_uses_received_heartbeat_mtime(self):
+        root = self.base / "tasks"
+        root.mkdir()
+        heartbeat = root / "heartbeat"
+        heartbeat.write_text(
+            "timestamp=1\niso_time=2026-08-14T10:00:00+0800\ncurrent_job=job-1\n",
+            encoding="utf-8",
+        )
+        now = time.time()
+        os.utime(heartbeat, (now, now))
+        online = worker_summary(root)
+        self.assertIn("🟢 ONLINE", online)
+        self.assertIn("2026-08-14T10:00:00+0800", online)
+        old = now - 31
+        os.utime(heartbeat, (old, old))
+        self.assertIn("🔴 OFFLINE", worker_summary(root))
 
 
 class ShellClientTest(unittest.TestCase):
@@ -271,6 +303,7 @@ class ShellClientTest(unittest.TestCase):
         self.assertFalse((destination / ".git").exists())
         self.assertFalse((destination / "tasks").exists())
         self.assertEqual(last_sync.read_text(encoding="utf-8").strip(), str(destination))
+        self.assertIn("--exclude='env.sh'", SYNC_TO_SERVER.read_text(encoding="utf-8"))
 
     def test_tracked_text_files_use_lf_line_endings(self):
         tracked = subprocess.run(
@@ -282,7 +315,11 @@ class ShellClientTest(unittest.TestCase):
         ).stdout.splitlines()
         for relative in tracked:
             path = PROJECT_DIR / relative
-            if path.suffix in {".py", ".sh", ".md"} or path.name.startswith("Dockerfile"):
+            if (
+                path.suffix in {".py", ".sh", ".md"}
+                or path.name in {"env.sh.example"}
+                or path.name.startswith("Dockerfile")
+            ):
                 self.assertNotIn(b"\r\n", path.read_bytes(), relative)
 
 

@@ -5,4 +5,5 @@ __pycache__/
 .ruff_cache/
 .last_sync_target
 .env
+env.sh
 tasks/

@@ -90,7 +90,7 @@ class Layout:
         return self.job_dir(job_id) / "exitcode"
 
 
-def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
+def atomic_write(path: Path, content: str, mode: int = 0o666) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -139,7 +139,7 @@ def submit(root: Path, script: Path, job_id: str | None = None) -> str:
     try:
         temp_dir.mkdir()
         copy_file_fsync(script, temp_dir / "run.sh", 0o755)
-        copy_file_fsync(script, temp_source, 0o644)
+        copy_file_fsync(script, temp_source, 0o666)
         os.replace(temp_source, source_copy)
         published_source = True
         os.replace(temp_dir, job_dir)
