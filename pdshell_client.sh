@@ -199,9 +199,9 @@ submit() {
     chmod 755 "$staging/run.sh"
     printf 'READY\nsubmitted_at=%s\n' "$(date +%s)" > "$staging/.ready"
 
-    run_rsync -a "$script" "$(remote_path "$job_id.sh")"
-    run_rsync -a --exclude='.ready' "$staging/" "$(remote_path "$job_id/")"
-    run_rsync -a "$staging/.ready" "$(remote_path "$job_id/.ready")"
+    run_rsync -a --chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw "$script" "$(remote_path "$job_id.sh")"
+    run_rsync -a --chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw --exclude='.ready' "$staging/" "$(remote_path "$job_id/")"
+    run_rsync -a --chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw "$staging/.ready" "$(remote_path "$job_id/.ready")"
     printf '%s\n' "$job_id"
 }
 

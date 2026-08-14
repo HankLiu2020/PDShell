@@ -56,23 +56,43 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
         raise RuntimeError("Gradio 未安装，请执行 pip install -r frontend/requirements.txt")
 
     def refresh(selected: str):
-        transport.sync_metadata()
+        sync_error = ""
+        try:
+            transport.sync_metadata()
+        except TransportError as exc:
+            sync_error = f" · 同步警告：{exc}（继续显示本地缓存）"
         snapshots = transport.snapshots()
         stdout = stderr = ""
         if selected:
-            transport.sync_job(selected)
+            try:
+                transport.sync_job(selected)
+            except TransportError as exc:
+                sync_error = f" · 日志同步警告：{exc}（继续显示本地缓存）"
             stdout, stderr = transport.logs(selected)
-        return transport.health(), _table_rows(snapshots), f"### 任务日志：{selected or '未选择'}", stdout, stderr
+        return (
+            transport.health() + sync_error,
+            _table_rows(snapshots),
+            f"### 任务日志：{selected or '未选择'}",
+            stdout,
+            stderr,
+        )
 
     def select_job(event: gr.SelectData):
         index = getattr(event, "index", None)
-        if isinstance(index, tuple):
+        if isinstance(index, (tuple, list)):
             index = index[0]
+        try:
+            transport.sync_metadata()
+        except TransportError:
+            pass
         snapshots = transport.snapshots()
         if not isinstance(index, int) or index < 0 or index >= len(snapshots):
             return "", "### 任务日志：未选择", "", ""
         job_id = snapshots[index].job_id
-        transport.sync_job(job_id)
+        try:
+            transport.sync_job(job_id)
+        except TransportError:
+            pass
         stdout, stderr = transport.logs(job_id)
         return job_id, f"### 任务日志：{job_id}", stdout, stderr
 
@@ -110,9 +130,9 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 log_header = gr.Markdown("### 任务日志：未选择")
                 with gr.Tabs():
                     with gr.Tab("stdout"):
-                        stdout = gr.Textbox(lines=30, max_lines=30, interactive=False)
+                        stdout = gr.Code(language="python", lines=30, interactive=False)
                     with gr.Tab("stderr"):
-                        stderr = gr.Textbox(lines=30, max_lines=30, interactive=False)
+                        stderr = gr.Code(language="python", lines=30, interactive=False)
 
         submit.click(submit_script, inputs=[upload, job_id], outputs=[submission])
         table.select(select_job, inputs=[], outputs=[selected_job, log_header, stdout, stderr])

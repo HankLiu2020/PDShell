@@ -125,6 +125,18 @@ export PDSHELL_SSH_PORT=30901
 
 同步后脚本会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
 
+集群连接参数可以放在仓库外的 `env.sh` 中，`env.sh` 已被 Git 和同步脚本排除；公开仓库只提供不含凭据的 [env.sh.example](</Users/hank/研究生数据/研2下/6.24 海康MVB/PDShell/env.sh.example>) 模板。优先使用 SSH key，密码只从安全环境注入。
+
+## NFS 多用户权限
+
+Worker 入口使用 `umask 000`，状态文件和审计副本使用 `0666`，客户端提交通过 rsync `--chmod` 将任务目录和文件放宽到共享盘上其他 UID 可读写。这是为“Worker UID 与提交者 UID 不同”的 NFS 场景准备的；已有旧任务目录需要在停 Worker 后由管理员一次性修复权限，例如：
+
+```bash
+chmod -R 777 /path/to/PDShell/tasks
+```
+
+这条命令会放宽任务目录权限，只应在受控共享目录使用。真实 NFS 的 root-squash、UID 映射和删除权限仍需按平台策略验证。
+
 ## Gradio 控制台
 
 Gradio 运行在用户自己的机器上，不在训练容器中启动远端服务。界面保持三个区域：左上上传脚本，左下 Worker 和任务监控，右侧选中任务的 stdout/stderr。
@@ -146,9 +158,9 @@ python3 frontend/app.py \
   --cache ~/.cache/pdshell
 ```
 
-Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可选 `PDSHELL_SSH_PASSWORD`。不传 `--endpoint` 时，本地模式默认使用仓库旁的 `tasks/`。
+Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可选 `PDSHELL_SSH_PASSWORD`。不传 `--endpoint` 时，本地模式默认使用仓库旁的 `tasks/`。Gradio 4.44–6.x 均以 `<7` 依赖范围支持；日志使用 Code 组件显示，兼容 Gradio 6 的交互行为。
 
-控制台每 2 秒刷新 heartbeat 和任务 marker，选中任务后同步日志；界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
+控制台每 2 秒刷新 heartbeat 和任务 marker，heartbeat 使用本地接收 mtime 判断在线状态，并额外展示 Worker 写入的服务器时间，避免前后端时钟偏差造成误判。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
 
 ## Docker 接入
 
@@ -161,11 +173,13 @@ docker run --rm -v /宿主机/持久化目录:/persist pdshell-mvp
 
 接入已有训练镜像时，把 `pdshell.py` 和 `docker-entrypoint.sh` 复制到 `/opt/pdshell/`，并把 entrypoint 设为容器 Entrypoint。可通过 `PDSHELL_ROOT` 覆盖默认 `/persist/tasks`。
 
+`Dockerfile.train` 是不含集群凭据的训练镜像接入示例，可通过 `--build-arg BASE_IMAGE=<已有训练镜像>` 替换基础镜像；真实 GPU runtime、原有训练 entrypoint 和持久化挂载仍由平台配置。
+
 Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重启尚未在真实训练平台验证。NFS、CIFS、CephFS 等目标共享存储也必须单独实测 `rename`、`flock`、权限和缓存一致性。
 
 ## 验证状态
 
-当前本地动态验证包含 27 项测试，覆盖：
+当前本地动态验证包含 28 项测试，覆盖：
 
 - v2 任务目录成功/失败闭环、纯文件提交、20 个批量任务串行执行。
 - 单 marker、审计副本、缺脚本、重复 ID、非法 ID、旧布局拒绝。
@@ -173,6 +187,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 - rsync 本地提交与缓存同步、scp 只读限制、日志尾部截断和 Shell 客户端闭环。
 - 非 22 SSH 端口、sshpass 参数脱敏、任意工作目录入口启动和环境变量默认根目录。
 - rsync 重复 ID 预检覆盖 READY、RUNNING、终态、半提交目录和审计副本；预检传输错误不会按“不存在”放行。
+- NFS 多 UID 文件权限、heartbeat mtime 在线判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
 - 工程同步排除运行数据、脚本执行权限和全仓库 LF 行尾检查。
 
 运行测试：
@@ -180,7 +195,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile pdshell.py frontend/transport.py frontend/app.py
-bash -n docker-entrypoint.sh pdshell_client.sh sync_to_server.sh
+bash -n docker-entrypoint.sh pdshell_client.sh sync_to_server.sh env.sh.example
 ```
 
 仓库通过 `.gitattributes` 强制 Python、Shell、Markdown 和 Dockerfile 使用 LF，避免 Windows/IDE 的 CRLF 转换制造整文件伪 diff。

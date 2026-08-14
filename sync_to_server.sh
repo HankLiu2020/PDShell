@@ -81,6 +81,7 @@ run_rsync -az \
     --exclude='.pdshell-cache/' \
     --exclude='.last_sync_target' \
     --exclude='.env' \
+    --exclude='env.sh' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     --exclude='.DS_Store' \

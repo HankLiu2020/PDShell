@@ -1,4 +1,5 @@
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,10 @@ class PDShellIntegrationTest(unittest.TestCase):
         failure = self.write_script("failure.sh", "echo before-failure\nexit 7\n")
         self.submit(success, "success-job")
         self.submit(failure, "failure-job")
+
+        self.assertEqual(stat.S_IMODE((self.root / "success-job.sh").stat().st_mode), 0o666)
+        self.assertEqual(stat.S_IMODE((self.root / "success-job" / "run.sh").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((self.root / "success-job" / ".ready").stat().st_mode), 0o666)
 
         self.run_worker_once()
 
@@ -274,6 +279,8 @@ class PDShellIntegrationTest(unittest.TestCase):
             worker.terminate()
             worker.communicate(timeout=3)
         self.assertEqual(worker.returncode, 0)
+        self.assertEqual(stat.S_IMODE((entrypoint_root / "worker.log").stat().st_mode), 0o666)
+        self.assertEqual(stat.S_IMODE((entrypoint_root / "worker.lock").stat().st_mode), 0o666)
 
     def test_legacy_layout_is_rejected(self):
         (self.root / "inbox").mkdir(parents=True)

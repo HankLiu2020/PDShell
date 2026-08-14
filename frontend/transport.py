@@ -12,6 +12,7 @@ from pathlib import Path
 CONTROL_NAMES = {"heartbeat", "worker.log", "worker.lock"}
 STATE_MARKERS = (".done", ".failed", ".running", ".ready")
 MAX_LOG_BYTES = 200 * 1024
+SUBMIT_CHMOD = "Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw"
 
 
 class TransportError(RuntimeError):
@@ -110,12 +111,16 @@ def worker_summary(root: Path, offline_after: float = 30.0) -> str:
     if not values:
         return "**Worker：🔴 OFFLINE**  · 未发现 heartbeat"
     try:
-        age = max(0.0, time.time() - float(values.get("timestamp", "0")))
-    except ValueError:
+        age = max(0.0, time.time() - heartbeat.stat().st_mtime)
+    except (FileNotFoundError, OSError):
         age = offline_after + 1
     state = "🟢 ONLINE" if age <= offline_after else "🔴 OFFLINE"
     current = values.get("current_job") or "空闲"
-    return f"**Worker：{state}**  · heartbeat {age:.1f}s 前  · 当前任务：`{current}`"
+    server_time = values.get("iso_time") or values.get("timestamp") or "未知"
+    return (
+        f"**Worker：{state}**  · heartbeat {age:.1f}s 前  · "
+        f"服务器时间：`{server_time}`  · 当前任务：`{current}`"
+    )
 
 
 class FileTransport:
@@ -197,7 +202,16 @@ class RsyncTransport(FileTransport):
     def _rsync_command(self) -> list[str]:
         command = ["rsync"]
         if _is_remote_endpoint(self.remote):
-            command.extend(["-e", f"ssh -p {self.ssh_port} -o ServerAliveInterval=30"])
+            command.extend(
+                [
+                    "-e",
+                    (
+                        f"ssh -p {self.ssh_port} -o ServerAliveInterval=30 "
+                        "-o ControlMaster=auto -o ControlPersist=60 "
+                        "-o ControlPath=~/.ssh/pdshell-%C"
+                    ),
+                ]
+            )
         if self.password_enabled:
             command = ["sshpass", "-e", *command]
         return command
@@ -252,6 +266,15 @@ class RsyncTransport(FileTransport):
 
     def sync_metadata(self) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
+        heartbeat_args = self._rsync_command() + [
+            "-a",
+            "--no-times",
+            "--include=heartbeat",
+            "--exclude=*",
+            self._remote(),
+            str(self._cache) + "/",
+        ]
+        self._run(heartbeat_args)
         args = self._rsync_command() + [
             "-a",
             "--include=*/",
@@ -271,14 +294,24 @@ class RsyncTransport(FileTransport):
         self._cache.mkdir(parents=True, exist_ok=True)
         destination = self._cache / job_id
         destination.mkdir(parents=True, exist_ok=True)
-        for name in (".ready", ".running", ".done", ".failed", "exitcode", "log", "stderr.log"):
-            try:
-                self._run(
-                    self._rsync_command()
-                    + ["-a", self._remote(f"{job_id}/{name}"), str(destination / name)]
-                )
-            except TransportError:
-                continue
+        args = self._rsync_command() + [
+            "-a",
+            "--include=*/",
+            "--include=.ready",
+            "--include=.running",
+            "--include=.done",
+            "--include=.failed",
+            "--include=exitcode",
+            "--include=log",
+            "--include=stderr.log",
+            "--exclude=*",
+            self._remote(f"{job_id}/"),
+            str(destination) + "/",
+        ]
+        try:
+            self._run(args)
+        except TransportError:
+            return
 
     def submit_script(self, script: Path, job_id: str | None = None) -> str:
         if job_id is None:
@@ -293,18 +326,28 @@ class RsyncTransport(FileTransport):
             shutil.copyfile(script, staging / "run.sh")
             ready = staging / ".ready"
             ready.write_text(f"READY\nsubmitted_at={time.time():.6f}\n", encoding="utf-8")
-            self._run(self._rsync_command() + ["-a", str(script), self._remote(f"{job_id}.sh")])
+            self._run(
+                self._rsync_command()
+                + ["-a", f"--chmod={SUBMIT_CHMOD}", str(script), self._remote(f"{job_id}.sh")]
+            )
             self._run(
                 self._rsync_command()
                 + [
                     "-a",
+                    f"--chmod={SUBMIT_CHMOD}",
                     "--exclude=.ready",
                     str(staging) + "/",
                     self._remote(f"{job_id}/"),
                 ]
             )
             self._run(
-                self._rsync_command() + ["-a", str(ready), self._remote(f"{job_id}/.ready")]
+                self._rsync_command()
+                + [
+                    "-a",
+                    f"--chmod={SUBMIT_CHMOD}",
+                    str(ready),
+                    self._remote(f"{job_id}/.ready"),
+                ]
             )
         return job_id
 

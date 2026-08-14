@@ -1,0 +1,13 @@
+# Generic training-image integration example. Replace BASE_IMAGE with the
+# platform's existing training image; do not put cluster credentials here.
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+WORKDIR /opt/pdshell
+COPY pdshell.py docker-entrypoint.sh ./
+RUN chmod +x /opt/pdshell/pdshell.py /opt/pdshell/docker-entrypoint.sh
+
+ENV PDSHELL_ROOT=/persist/tasks
+ENV PDSHELL_POLL_INTERVAL=1
+VOLUME ["/persist"]
+ENTRYPOINT ["/opt/pdshell/docker-entrypoint.sh"]
