@@ -10,7 +10,7 @@ PDShell（Persistent Directory Shell）把一个没有 SSH 或交互终端的长
 
 ```text
 $PDSHELL_ROOT/
-├── <id>.sh                  # 外部脚本的只读审计副本，可选
+├── <id>.sh                  # 外部脚本的审计副本，可选；Worker 不执行此文件
 ├── <id>/
 │   ├── run.sh               # 完整落盘后执行的脚本副本
 │   ├── .ready               # READY：提交最后一步
@@ -25,7 +25,7 @@ $PDSHELL_ROOT/
 └── worker.lock              # 单 Worker flock
 ```
 
-同一时刻正常情况下每个任务目录只有一个状态文件。状态真相是 marker 文件名，而不是缓存快照：
+同一时刻正常情况下每个任务目录只有一个状态文件。`.ready` 以及后续 marker 会保留 `submitted_at=<Unix 时间戳>`，供控制台按提交时间倒序展示；没有该字段的手工任务回退到目录更新时间。状态真相是 marker 文件名，而不是缓存快照：
 
 ```text
 .ready → .running → .done
@@ -125,7 +125,7 @@ export PDSHELL_SSH_PORT=30901
 
 同步后脚本会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
 
-集群连接参数可以放在仓库外的 `env.sh` 中，`env.sh` 已被 Git 和同步脚本排除；公开仓库只提供不含凭据的 [env.sh.example](</Users/hank/研究生数据/研2下/6.24 海康MVB/PDShell/env.sh.example>) 模板。优先使用 SSH key，密码只从安全环境注入。
+集群连接参数可以放在仓库外的 `env.sh` 中，`env.sh` 已被 Git 和同步脚本排除；公开仓库只提供不含凭据的 [env.sh.example](env.sh.example) 模板。优先使用 SSH key，密码只从安全环境注入。
 
 ## NFS 多用户权限
 
@@ -162,6 +162,8 @@ Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可�
 
 控制台每 2 秒刷新 heartbeat 和任务 marker，heartbeat 使用本地接收 mtime 判断在线状态，并额外展示 Worker 写入的服务器时间，避免前后端时钟偏差造成误判。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
 
+提交区既支持上传 `.sh` 文件，也支持直接粘贴脚本。上传文件且任务 ID 留空时，默认使用“文件名去扩展名 + `YYYYMMDD-HHMMSS`”；手填 ID 优先。任务表按提交时间从新到旧显示，最右侧显示删除操作；先选中任务、勾选确认，再点击删除。删除会同时移除远端任务目录和 `<id>.sh` 审计副本，并拒绝删除 `.running` 任务；scp 只读模式不提供提交和删除。
+
 ## Docker 接入
 
 `Dockerfile.example` 可用于构建演示镜像：
@@ -179,7 +181,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 
 ## 验证状态
 
-当前本地动态验证包含 28 项测试，覆盖：
+当前本地动态验证包含 32 项测试，覆盖：
 
 - v2 任务目录成功/失败闭环、纯文件提交、20 个批量任务串行执行。
 - 单 marker、审计副本、缺脚本、重复 ID、非法 ID、旧布局拒绝。
@@ -189,6 +191,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 - rsync 重复 ID 预检覆盖 READY、RUNNING、终态、半提交目录和审计副本；预检传输错误不会按“不存在”放行。
 - NFS 多 UID 文件权限、heartbeat mtime 在线判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
 - 工程同步排除运行数据、脚本执行权限和全仓库 LF 行尾检查。
+- Gradio 粘贴脚本、上传文件名任务 ID、提交时间排序和任务删除安全闸门。
 
 运行测试：
 

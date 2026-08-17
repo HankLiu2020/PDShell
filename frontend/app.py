@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,7 +41,10 @@ def _format_updated(snapshot: JobSnapshot) -> str:
 
 
 def _table_rows(snapshots: list[JobSnapshot]) -> list[list[str]]:
-    return [[item.job_id, item.state, item.exitcode or "-", _format_updated(item)] for item in snapshots]
+    return [
+        [item.job_id, item.state, item.exitcode or "-", _format_updated(item), "🗑️ 删除"]
+        for item in snapshots
+    ]
 
 
 def _upload_path(value: object) -> Path:
@@ -49,6 +55,44 @@ def _upload_path(value: object) -> Path:
     if hasattr(value, "name"):
         return Path(str(value.name))
     raise ValueError("没有选择 Shell 脚本")
+
+
+def _suggest_job_id(value: object, current: str | None = "") -> str:
+    current = current or ""
+    if current.strip():
+        return current
+    try:
+        stem = _upload_path(value).stem
+    except (TypeError, ValueError, OSError):
+        return current
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", stem)
+    base = re.sub(r"^[^A-Za-z0-9]+", "", base).strip("._-") or "task"
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    base = base[: max(1, 128 - len(timestamp) - 1)]
+    return f"{base}-{timestamp}"
+
+
+def submit_source(
+    transport: FileTransport,
+    upload: object,
+    paste_script_value: str | None,
+    job_id: str | None = "",
+) -> str:
+    if transport.read_only:
+        raise TransportError("当前是 scp 只读模式，不能提交任务")
+    selected = (job_id or "").strip() or None
+    if upload not in (None, ""):
+        script = _upload_path(upload)
+        selected = selected or _suggest_job_id(upload)
+        return transport.submit_script(script, selected)
+    script_text = paste_script_value or ""
+    if not script_text.strip():
+        raise ValueError("请选择脚本文件或粘贴 Shell 脚本内容")
+    with tempfile.TemporaryDirectory(prefix="pdshell-paste-") as temporary:
+        script = Path(temporary) / "run.sh"
+        script.write_text(script_text if script_text.endswith("\n") else script_text + "\n", encoding="utf-8")
+        script.chmod(0o755)
+        return transport.submit_script(script, selected)
 
 
 def build_demo(transport: FileTransport, poll_interval: float = 2.0):
@@ -96,15 +140,73 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
         stdout, stderr = transport.logs(job_id)
         return job_id, f"### 任务日志：{job_id}", stdout, stderr
 
-    def submit_script(upload: object, job_id: str):
-        if transport.read_only:
-            return "⚠️ 当前是 scp 只读模式，不能提交任务。"
+    def submit_script(upload: object, paste_script_value: str, job_id: str):
         try:
-            selected = job_id.strip() or None
-            created = transport.submit_script(_upload_path(upload), selected)
+            created = submit_source(transport, upload, paste_script_value, job_id)
             return f"✅ 已提交 `{created}`；Worker 将在下一轮扫描中领取。"
         except (OSError, ValueError, TransportError) as exc:
             return f"❌ 提交失败：`{exc}`"
+
+    def delete_selected(job_id: str, confirmed: bool):
+        if transport.read_only:
+            stdout, stderr = transport.logs(job_id) if job_id else ("", "")
+            return (
+                "⚠️ 当前是 scp 只读模式，不能删除任务。",
+                job_id,
+                transport.health(),
+                _table_rows(transport.snapshots()),
+                f"### 任务日志：{job_id or '未选择'}",
+                stdout,
+                stderr,
+                confirmed,
+            )
+        if not job_id:
+            return (
+                "⚠️ 请先点击任务列表中的一行。",
+                job_id,
+                transport.health(),
+                _table_rows(transport.snapshots()),
+                "### 任务日志：未选择",
+                "",
+                "",
+                confirmed,
+            )
+        if not confirmed:
+            stdout, stderr = transport.logs(job_id)
+            return (
+                "⚠️ 删除不可恢复，请先勾选确认框。",
+                job_id,
+                transport.health(),
+                _table_rows(transport.snapshots()),
+                f"### 任务日志：{job_id}",
+                stdout,
+                stderr,
+                confirmed,
+            )
+        try:
+            transport.delete_job(job_id)
+        except TransportError as exc:
+            stdout, stderr = transport.logs(job_id)
+            return (
+                f"❌ 删除失败：`{exc}`",
+                job_id,
+                transport.health(),
+                _table_rows(transport.snapshots()),
+                f"### 任务日志：{job_id}",
+                stdout,
+                stderr,
+                confirmed,
+            )
+        return (
+            f"✅ 已删除任务 `{job_id}`（任务目录和审计脚本）。",
+            "",
+            transport.health(),
+            _table_rows(transport.snapshots()),
+            "### 任务日志：未选择",
+            "",
+            "",
+            False,
+        )
 
     with gr.Blocks(title="PDShell") as demo:
         selected_job = gr.State("")
@@ -112,6 +214,12 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
             with gr.Column(scale=1, min_width=300):
                 gr.Markdown("## 上传脚本")
                 upload = gr.File(label="Shell 脚本", file_types=[".sh"], type="filepath")
+                paste_script = gr.Code(
+                    label="或直接粘贴 Shell 脚本",
+                    language="python",
+                    lines=12,
+                    interactive=not transport.read_only,
+                )
                 job_id = gr.Textbox(label="任务 ID（留空自动生成）", placeholder="例如 train-001")
                 submit = gr.Button("提交任务", variant="primary", interactive=not transport.read_only)
                 submission = gr.Markdown("当前传输模式为 scp 只读。" if transport.read_only else "准备好脚本后提交。")
@@ -119,12 +227,25 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 health = gr.Markdown("正在读取 Worker 状态…")
                 refresh_button = gr.Button("立即刷新")
                 table = gr.Dataframe(
-                    headers=["任务 ID", "状态", "退出码", "更新时间"],
-                    datatype=["str", "str", "str", "str"],
+                    headers=["任务 ID", "状态", "退出码", "更新时间", "操作"],
+                    datatype=["str", "str", "str", "str", "str"],
                     value=[],
                     row_count=0,
                     interactive=False,
                     wrap=True,
+                )
+                delete_confirm = gr.Checkbox(
+                    label="确认删除选中的任务（不可恢复）",
+                    value=False,
+                    interactive=not transport.read_only,
+                )
+                delete_button = gr.Button(
+                    "🗑️ 删除选中任务",
+                    variant="stop",
+                    interactive=not transport.read_only,
+                )
+                delete_status = gr.Markdown(
+                    "scp 模式为只读，删除按钮已禁用。" if transport.read_only else "先点击任务行，再确认删除。"
                 )
             with gr.Column(scale=2, min_width=500):
                 log_header = gr.Markdown("### 任务日志：未选择")
@@ -134,8 +255,14 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                     with gr.Tab("stderr"):
                         stderr = gr.Code(language="python", lines=30, interactive=False)
 
-        submit.click(submit_script, inputs=[upload, job_id], outputs=[submission])
+        submit.click(submit_script, inputs=[upload, paste_script, job_id], outputs=[submission])
+        upload.change(_suggest_job_id, inputs=[upload, job_id], outputs=[job_id])
         table.select(select_job, inputs=[], outputs=[selected_job, log_header, stdout, stderr])
+        delete_button.click(
+            delete_selected,
+            inputs=[selected_job, delete_confirm],
+            outputs=[delete_status, selected_job, health, table, log_header, stdout, stderr, delete_confirm],
+        )
         refresh_button.click(refresh, inputs=[selected_job], outputs=[health, table, log_header, stdout, stderr])
         if hasattr(gr, "Timer"):
             timer = gr.Timer(value=poll_interval)

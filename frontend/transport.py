@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -34,6 +35,7 @@ class JobSnapshot:
     state: str
     exitcode: str
     updated_at: float
+    submitted_at: float = 0.0
 
 
 def _read_text(path: Path, default: str = "") -> str:
@@ -55,6 +57,22 @@ def _marker_state(job_dir: Path) -> str:
     return "INCOMPLETE"
 
 
+def _submitted_at(job_dir: Path, fallback: float) -> float:
+    for marker in STATE_MARKERS:
+        content = _read_text(job_dir / marker)
+        for line in content.splitlines():
+            if not line.startswith("submitted_at="):
+                continue
+            try:
+                return float(line.split("=", 1)[1])
+            except ValueError:
+                break
+    try:
+        return job_dir.stat().st_mtime or fallback
+    except (FileNotFoundError, OSError):
+        return fallback
+
+
 def snapshot_job(job_dir: Path) -> JobSnapshot:
     mtimes = []
     for path in (job_dir / name for name in STATE_MARKERS + ("exitcode", "log", "stderr.log")):
@@ -62,11 +80,13 @@ def snapshot_job(job_dir: Path) -> JobSnapshot:
             mtimes.append(path.stat().st_mtime)
         except FileNotFoundError:
             pass
+    updated_at = max(mtimes, default=0.0)
     return JobSnapshot(
         job_id=job_dir.name,
         state=_marker_state(job_dir),
         exitcode=_read_text(job_dir / "exitcode").strip(),
-        updated_at=max(mtimes, default=0.0),
+        updated_at=updated_at,
+        submitted_at=_submitted_at(job_dir, updated_at),
     )
 
 
@@ -102,7 +122,11 @@ def list_snapshots(root: Path) -> list[JobSnapshot]:
         for path in root.iterdir()
         if path.is_dir() and not path.name.startswith(".") and path.name not in CONTROL_NAMES
     ]
-    return sorted((snapshot_job(path) for path in jobs), key=lambda item: item.job_id)
+    return sorted(
+        (snapshot_job(path) for path in jobs),
+        key=lambda item: (item.submitted_at, item.updated_at, item.job_id),
+        reverse=True,
+    )
 
 
 def worker_summary(root: Path, offline_after: float = 30.0) -> str:
@@ -138,6 +162,9 @@ class FileTransport:
     def submit_script(self, script: Path, job_id: str | None = None) -> str:
         raise NotImplementedError
 
+    def delete_job(self, job_id: str) -> None:
+        raise NotImplementedError
+
     def snapshots(self) -> list[JobSnapshot]:
         return list_snapshots(self.root())
 
@@ -166,6 +193,21 @@ class LocalTransport(FileTransport):
         from pdshell import submit
 
         return submit(self._root, script, job_id)
+
+    def delete_job(self, job_id: str) -> None:
+        validate_job_id(job_id)
+        job_dir = self._root / job_id
+        if (job_dir / ".running").is_file():
+            raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
+        if job_dir.exists() and job_dir.is_symlink():
+            raise TransportError(f"任务目录不能是符号链接: {job_id}")
+        if job_dir.exists():
+            if not job_dir.is_dir():
+                raise TransportError(f"任务路径不是目录，拒绝删除: {job_id}")
+            shutil.rmtree(job_dir)
+        audit_copy = self._root / f"{job_id}.sh"
+        if audit_copy.exists() or audit_copy.is_symlink():
+            audit_copy.unlink()
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -219,7 +261,9 @@ class RsyncTransport(FileTransport):
     def _run(self, args: Sequence[str]) -> None:
         try:
             if self.runner is not None:
-                self.runner(args)
+                result = self.runner(args)
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
             else:
                 subprocess.run(
                     args,
@@ -230,6 +274,45 @@ class RsyncTransport(FileTransport):
                 )
         except (OSError, subprocess.CalledProcessError) as exc:
             raise TransportError(f"传输失败: {' '.join(args)}") from exc
+
+    def _ssh_command(self) -> list[str]:
+        command = [
+            "ssh",
+            "-p",
+            str(self.ssh_port),
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            "ControlPath=~/.ssh/pdshell-%C",
+        ]
+        if self.password_enabled:
+            command = ["sshpass", "-e", *command]
+        return command
+
+    def _run_remote(self, remote_command: str) -> None:
+        if not _is_remote_endpoint(self.remote):
+            raise TransportError("本地路径不支持远程 SSH 操作")
+        host, _remote_root = self.remote.split(":", 1)
+        args = self._ssh_command() + [host, "sh", "-c", remote_command]
+        try:
+            if self.runner is not None:
+                result = self.runner(args)
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+            else:
+                subprocess.run(
+                    args,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=self.environment,
+                )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise TransportError(f"远端操作失败: {' '.join(args)}") from exc
 
     def _job_exists(self, job_id: str) -> bool:
         args = self._rsync_command() + [
@@ -290,7 +373,7 @@ class RsyncTransport(FileTransport):
         ]
         self._run(args)
 
-    def sync_job(self, job_id: str) -> None:
+    def _sync_job(self, job_id: str, tolerate_errors: bool) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
         destination = self._cache / job_id
         destination.mkdir(parents=True, exist_ok=True)
@@ -311,7 +394,43 @@ class RsyncTransport(FileTransport):
         try:
             self._run(args)
         except TransportError:
-            return
+            if not tolerate_errors:
+                raise
+
+    def sync_job(self, job_id: str) -> None:
+        self._sync_job(job_id, tolerate_errors=True)
+
+    def delete_job(self, job_id: str) -> None:
+        validate_job_id(job_id)
+        if _is_remote_endpoint(self.remote):
+            self._sync_job(job_id, tolerate_errors=False)
+            if (self._cache / job_id / ".running").is_file():
+                raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
+            _host, remote_root = self.remote.split(":", 1)
+            remote_job = f"{remote_root.rstrip('/')}/{job_id}"
+            command = "rm -rf -- " + " ".join(
+                shlex.quote(path) for path in (remote_job, remote_job + ".sh")
+            )
+            self._run_remote(command)
+        else:
+            job_dir = self._cache / job_id
+            if (job_dir / ".running").is_file():
+                raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
+            if job_dir.exists() and job_dir.is_symlink():
+                raise TransportError(f"任务目录不能是符号链接: {job_id}")
+            if job_dir.exists():
+                if not job_dir.is_dir():
+                    raise TransportError(f"任务路径不是目录，拒绝删除: {job_id}")
+                shutil.rmtree(job_dir)
+            audit_copy = self._cache / f"{job_id}.sh"
+            if audit_copy.exists() or audit_copy.is_symlink():
+                audit_copy.unlink()
+        cached_job = self._cache / job_id
+        if cached_job.exists() and not cached_job.is_symlink() and cached_job.is_dir():
+            shutil.rmtree(cached_job)
+        cached_audit = self._cache / f"{job_id}.sh"
+        if cached_audit.exists() or cached_audit.is_symlink():
+            cached_audit.unlink()
 
     def submit_script(self, script: Path, job_id: str | None = None) -> str:
         if job_id is None:
@@ -415,6 +534,9 @@ class ScpTransport(FileTransport):
 
     def submit_script(self, script: Path, job_id: str | None = None) -> str:
         raise TransportError("scp 模式只读，请切换为 rsync 后提交任务")
+
+    def delete_job(self, job_id: str) -> None:
+        raise TransportError("scp 模式只读，不能删除任务")
 
 
 def make_transport(

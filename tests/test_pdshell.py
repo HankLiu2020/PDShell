@@ -68,6 +68,17 @@ class PDShellIntegrationTest(unittest.TestCase):
         self.assertEqual(self.state_files("failure-job"), [".failed"])
         self.assertEqual((failure_dir / "exitcode").read_text(), "7\n")
 
+    def test_submitted_at_metadata_survives_marker_transitions(self):
+        script = self.write_script("metadata.sh", "echo metadata\n")
+        self.submit(script, "metadata-job")
+        ready = (self.root / "metadata-job" / ".ready").read_text(encoding="utf-8")
+        self.assertRegex(ready, r"submitted_at=\d+\.\d+")
+
+        self.run_worker_once()
+
+        done = (self.root / "metadata-job" / ".done").read_text(encoding="utf-8")
+        self.assertIn("submitted_at=", done)
+
     def test_external_client_can_submit_with_files_only(self):
         worker = subprocess.Popen(
             [sys.executable, str(PDSHELL), "worker", "--root", str(self.root), "--poll-interval", "0.02"],
