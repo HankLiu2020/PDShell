@@ -107,6 +107,20 @@ def atomic_write(path: Path, content: str, mode: int = 0o666) -> None:
             pass
 
 
+def submitted_at_line(content: str) -> str:
+    for line in content.splitlines():
+        if line.startswith("submitted_at="):
+            return line
+    return ""
+
+
+def submitted_at_marker(path: Path) -> str:
+    try:
+        return submitted_at_line(path.read_text(encoding="utf-8", errors="replace"))
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 def copy_file_fsync(source: Path, destination: Path, mode: int) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
@@ -215,7 +229,9 @@ class Worker:
                 self.log(f"清理冲突的遗留 running 标记: {job_id}")
                 continue
             atomic_write(self.layout.exitcode(job_id), "-1\n")
-            atomic_write(marker, "WORKER_LOST\n")
+            metadata = submitted_at_marker(marker)
+            content = "WORKER_LOST\n" + (metadata + "\n" if metadata else "")
+            atomic_write(marker, content)
             os.replace(marker, failed)
             self.log(f"恢复任务 {job_id}: RUNNING -> WORKER_LOST")
             recovered += 1
@@ -265,7 +281,9 @@ class Worker:
             os.replace(ready, running)
         except FileNotFoundError:
             return None
-        atomic_write(running, "RUNNING\n")
+        metadata = submitted_at_marker(running)
+        content = "RUNNING\n" + (metadata + "\n" if metadata else "")
+        atomic_write(running, content)
         self.log(f"领取任务 {job_id}")
         return job_id
 
@@ -273,8 +291,10 @@ class Worker:
         running = self.layout.running(job_id)
         outcome = "SUCCEEDED" if exitcode == 0 else "FAILED"
         destination = self.layout.done(job_id) if exitcode == 0 else self.layout.failed(job_id)
+        metadata = submitted_at_marker(running)
         atomic_write(self.layout.exitcode(job_id), f"{exitcode}\n")
-        atomic_write(running, outcome + "\n")
+        content = outcome + "\n" + (metadata + "\n" if metadata else "")
+        atomic_write(running, content)
         os.replace(running, destination)
         self.log(f"任务 {job_id} 结束: {outcome}, exitcode={exitcode}")
 

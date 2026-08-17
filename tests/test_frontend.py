@@ -12,7 +12,9 @@ CLIENT = PROJECT_DIR / "pdshell_client.sh"
 SYNC_TO_SERVER = PROJECT_DIR / "sync_to_server.sh"
 sys.path.insert(0, str(PROJECT_DIR))
 
+from frontend.app import _suggest_job_id, _table_rows, submit_source
 from frontend.transport import (
+    LocalTransport,
     RsyncTransport,
     ScpTransport,
     TransportError,
@@ -164,15 +166,70 @@ class FrontendTransportTest(unittest.TestCase):
         root = self.base / "tasks"
         done = root / "done-job"
         done.mkdir(parents=True)
-        (done / ".done").write_text("SUCCEEDED\n", encoding="utf-8")
+        (done / ".done").write_text("SUCCEEDED\nsubmitted_at=10\n", encoding="utf-8")
         (done / ".ready").write_text("READY\n", encoding="utf-8")
         incomplete = root / "partial-job"
         incomplete.mkdir(parents=True)
+        os.utime(incomplete, (20, 20))
         snapshots = list_snapshots(root)
         self.assertEqual([(item.job_id, item.state) for item in snapshots], [
-            ("done-job", "SUCCEEDED"),
             ("partial-job", "INCOMPLETE"),
+            ("done-job", "SUCCEEDED"),
         ])
+
+    def test_local_delete_removes_task_and_audit_but_rejects_running(self):
+        root = self.base / "tasks"
+        root.mkdir()
+        finished = root / "finished-job"
+        finished.mkdir()
+        (finished / ".done").write_text("SUCCEEDED\n", encoding="utf-8")
+        (finished / "log").write_text("output\n", encoding="utf-8")
+        (root / "finished-job.sh").write_text("echo output\n", encoding="utf-8")
+        transport = LocalTransport(root)
+        transport.delete_job("finished-job")
+        self.assertFalse(finished.exists())
+        self.assertFalse((root / "finished-job.sh").exists())
+
+        running = root / "running-job"
+        running.mkdir()
+        (running / ".running").write_text("RUNNING\n", encoding="utf-8")
+        with self.assertRaisesRegex(TransportError, "正在运行"):
+            transport.delete_job("running-job")
+        self.assertTrue(running.exists())
+
+    def test_rsync_delete_uses_exact_remote_paths_and_rejects_password_argument(self):
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        transport = RsyncTransport(
+            "user@example:/persist/tasks",
+            self.base / "cache",
+            runner=runner,
+            ssh_port=30901,
+            password="hidden-password",
+        )
+        transport.delete_job("safe-job")
+        delete_call = calls[-1]
+        self.assertEqual(delete_call[:3], ["sshpass", "-e", "ssh"])
+        self.assertIn("rm -rf -- /persist/tasks/safe-job /persist/tasks/safe-job.sh", delete_call[-1])
+        self.assertNotIn("hidden-password", delete_call)
+
+    def test_submit_source_supports_paste_and_filename_timestamp_id(self):
+        root = self.base / "tasks"
+        transport = LocalTransport(root)
+        created = submit_source(transport, None, "echo pasted", "pasted-job")
+        self.assertEqual(created, "pasted-job")
+        self.assertEqual((root / "pasted-job" / "run.sh").read_text(), "echo pasted\n")
+
+        upload = self.base / "camera train.sh"
+        upload.write_text("echo uploaded\n", encoding="utf-8")
+        suggested = _suggest_job_id(str(upload))
+        self.assertRegex(suggested, r"^camera-train-\d{8}-\d{6}$")
+        self.assertEqual(_suggest_job_id(str(upload), "manual-id"), "manual-id")
+        self.assertIn("🗑️ 删除", _table_rows(list_snapshots(root))[-1])
 
     def test_worker_summary_uses_received_heartbeat_mtime(self):
         root = self.base / "tasks"
