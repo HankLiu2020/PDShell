@@ -80,6 +80,9 @@ class Layout:
     def failed(self, job_id: str) -> Path:
         return self.marker(job_id, "failed")
 
+    def delete(self, job_id: str) -> Path:
+        return self.marker(job_id, "delete")
+
     def stdout(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "log"
 
@@ -185,6 +188,7 @@ class Worker:
         self.current_process: subprocess.Popen[bytes] | None = None
         self.stop_requested = False
         self.lock_handle = None
+        self._delete_warning_jobs: set[str] = set()
 
     def log(self, message: str) -> None:
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -257,6 +261,55 @@ class Worker:
         os.replace(ready, failed)
         self.log(f"非法 ready 已转为 FAILED: {job_id}")
 
+    def process_deletes(self) -> int:
+        processed = 0
+        for marker in sorted(self.layout.root.glob("*/.delete")):
+            if marker.is_symlink() or not marker.is_file():
+                continue
+            job_id = marker.parent.name
+            try:
+                validate_job_id(job_id)
+            except ValueError:
+                if job_id not in self._delete_warning_jobs:
+                    self.log(f"忽略非法任务目录的 delete 标记: {job_id}")
+                    self._delete_warning_jobs.add(job_id)
+                continue
+
+            job_dir = self.layout.job_dir(job_id)
+            if job_dir.is_symlink() or not job_dir.is_dir():
+                if job_id not in self._delete_warning_jobs:
+                    self.log(f"忽略非目录任务的 delete 标记: {job_id}")
+                    self._delete_warning_jobs.add(job_id)
+                continue
+            if self.layout.running(job_id).is_file():
+                continue
+
+            try:
+                audit_script = self.layout.source_script(job_id)
+                try:
+                    audit_script.unlink()
+                except FileNotFoundError:
+                    pass
+                shutil.rmtree(job_dir)
+            except OSError as exc:
+                if job_id not in self._delete_warning_jobs:
+                    self.log(f"删除任务 {job_id} 暂时失败，将在下一轮重试: {exc}")
+                    self._delete_warning_jobs.add(job_id)
+                continue
+            self._delete_warning_jobs.discard(job_id)
+            self.log(f"Worker 删除任务: {job_id}")
+            processed += 1
+        return processed
+
+    def restore_claim_for_delete(self, job_id: str) -> None:
+        running = self.layout.running(job_id)
+        ready = self.layout.ready(job_id)
+        if self.layout.delete(job_id).is_file():
+            try:
+                os.replace(running, ready)
+            except FileNotFoundError:
+                pass
+
     def claim(self, ready: Path) -> str | None:
         if ready.name != ".ready" or not ready.is_file():
             return None
@@ -276,10 +329,15 @@ class Worker:
         if running.exists():
             self.consume_duplicate_ready(ready, f"清理已有 RUNNING 的重复 ready: {job_id}")
             return None
+        if self.layout.delete(job_id).is_file():
+            return None
 
         try:
             os.replace(ready, running)
         except FileNotFoundError:
+            return None
+        if self.layout.delete(job_id).is_file():
+            self.restore_claim_for_delete(job_id)
             return None
         metadata = submitted_at_marker(running)
         content = "RUNNING\n" + (metadata + "\n" if metadata else "")
@@ -300,6 +358,9 @@ class Worker:
 
     def execute(self, job_id: str) -> None:
         job_dir = self.layout.job_dir(job_id)
+        if self.layout.delete(job_id).is_file():
+            self.restore_claim_for_delete(job_id)
+            return
         run_script = job_dir / "run.sh"
         self.current_job = job_id
         self.write_heartbeat()
@@ -369,6 +430,7 @@ class Worker:
         try:
             while not self.stop_requested:
                 self.write_heartbeat()
+                delete_count = self.process_deletes()
                 ready_files = sorted(
                     marker
                     for marker in self.layout.root.glob("*/.ready")
@@ -383,7 +445,9 @@ class Worker:
                     self.execute(job_id)
                     if self.stop_requested:
                         break
-                if once and not claimed_any:
+                if not claimed_any:
+                    delete_count += self.process_deletes()
+                if once and not claimed_any and not delete_count:
                     break
                 if not self.stop_requested:
                     time.sleep(self.poll_interval)

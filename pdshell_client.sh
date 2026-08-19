@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/env.sh"
+fi
+
 REMOTE=${PDSHELL_REMOTE:-}
 REMOTE_ROOT=${PDSHELL_REMOTE_ROOT:-}
 SSH_HOST=${PDSHELL_SSH_HOST:-}
@@ -11,6 +17,7 @@ MODE=${PDSHELL_TRANSPORT:-rsync}
 CACHE=${PDSHELL_CACHE:-${TMPDIR:-/tmp}/pdshell-cache}
 POLL_INTERVAL=${PDSHELL_POLL_INTERVAL:-2}
 MAX_LOG_BYTES=204800
+NFS_RSYNC_FLAGS=(--no-owner --no-group --no-perms --no-times)
 
 if [[ -z "$REMOTE" && -n "$SSH_HOST" && -n "$REMOTE_ROOT" ]]; then
     REMOTE=${SSH_USER:+$SSH_USER@}${SSH_HOST}:${REMOTE_ROOT}
@@ -24,6 +31,7 @@ usage() {
   pdshell_client.sh status <job-id>
   pdshell_client.sh watch <job-id>
   pdshell_client.sh logs <job-id> [stdout|stderr]
+  pdshell_client.sh delete <job-id>
 
 配置:
   PDSHELL_REMOTE=user@host:/persist/tasks 或本地 tasks 路径
@@ -51,7 +59,7 @@ require_sshpass() {
 }
 
 run_rsync() {
-    local command_args=(rsync)
+    local command_args=(rsync "${NFS_RSYNC_FLAGS[@]}")
     if is_remote_endpoint; then
         command_args+=(-e "ssh -p $SSH_PORT -o ServerAliveInterval=30")
     fi
@@ -127,7 +135,9 @@ sync_metadata() {
             --include='.running' \
             --include='.done' \
             --include='.failed' \
+            --include='.delete' \
             --include='exitcode' \
+            --delete \
             --exclude='*' \
             "$(remote_path '')" "$CACHE/"
     elif [[ "$MODE" == "scp" ]]; then
@@ -142,10 +152,19 @@ sync_job() {
     local job_id=$1
     mkdir -p "$CACHE/$job_id"
     if [[ "$MODE" == "rsync" ]]; then
-        local name
-        for name in .ready .running .done .failed exitcode log stderr.log; do
-            run_rsync -a "$(remote_path "$job_id/$name")" "$CACHE/$job_id/$name" 2>/dev/null || true
-        done
+        run_rsync -a \
+            --include='*/' \
+            --include='.ready' \
+            --include='.running' \
+            --include='.done' \
+            --include='.failed' \
+            --include='.delete' \
+            --include='exitcode' \
+            --include='log' \
+            --include='stderr.log' \
+            --delete \
+            --exclude='*' \
+            "$(remote_path "$job_id/")" "$CACHE/$job_id/" 2>/dev/null || true
     else
         run_scp -q -r "$(remote_path "$job_id/.")" "$CACHE/$job_id" 2>/dev/null || true
     fi
@@ -153,7 +172,11 @@ sync_job() {
 
 state_for() {
     local job_dir=$1
-    if [[ -f "$job_dir/.done" ]]; then
+    if [[ -f "$job_dir/.running" && -f "$job_dir/.delete" ]]; then
+        printf 'RUNNING'
+    elif [[ -f "$job_dir/.delete" ]]; then
+        printf 'DELETING'
+    elif [[ -f "$job_dir/.done" ]]; then
         printf 'SUCCEEDED'
     elif [[ -f "$job_dir/.failed" ]]; then
         head -n 1 "$job_dir/.failed"
@@ -241,6 +264,38 @@ logs() {
     tail -c "$MAX_LOG_BYTES" "$CACHE/$job_id/$stream_file"
 }
 
+delete_job() {
+    [[ "$MODE" == "rsync" ]] || { printf 'scp 模式只读，不能删除任务\n' >&2; exit 2; }
+    local job_id=$1
+    validate_job_id "$job_id" || { printf '非法任务 ID: %s\n' "$job_id" >&2; exit 2; }
+    local precheck_exitcode
+    if remote_job_exists "$job_id"; then
+        :
+    else
+        precheck_exitcode=$?
+        if [[ "$precheck_exitcode" -eq 1 ]]; then
+            printf '任务不存在，拒绝删除: %s\n' "$job_id" >&2
+        fi
+        exit "$precheck_exitcode"
+    fi
+    sync_job "$job_id"
+    local state
+    state=$(state_for "$CACHE/$job_id")
+    [[ "$state" == "RUNNING" ]] && {
+        printf '任务正在运行，拒绝删除: %s\n' "$job_id" >&2
+        exit 2
+    }
+    local staging
+    staging=$(mktemp -d "${TMPDIR:-/tmp}/pdshell-delete.XXXXXX")
+    trap 'rm -rf "$staging"' RETURN
+    printf 'DELETE\nrequested_at=%s\n' "$(date +%s)" > "$staging/.delete"
+    run_rsync -a --chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw \
+        "$staging/.delete" "$(remote_path "$job_id/.delete")"
+    mkdir -p "$CACHE/$job_id"
+    cp "$staging/.delete" "$CACHE/$job_id/.delete"
+    printf '已提交删除请求: %s\n' "$job_id"
+}
+
 watch_job() {
     local job_id=$1
     while true; do
@@ -274,6 +329,10 @@ case "$command_name" in
     logs)
         [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
         logs "$2" "${3:-stdout}"
+        ;;
+    delete)
+        [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+        delete_job "$2"
         ;;
     *)
         usage >&2

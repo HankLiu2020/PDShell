@@ -198,7 +198,7 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 confirmed,
             )
         return (
-            f"✅ 已删除任务 `{job_id}`（任务目录和审计脚本）。",
+            f"✅ 已提交删除请求 `{job_id}`；Worker 将清理任务目录和审计脚本。",
             "",
             transport.health(),
             _table_rows(transport.snapshots()),
