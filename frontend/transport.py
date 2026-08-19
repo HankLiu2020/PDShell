@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -12,8 +11,10 @@ from pathlib import Path
 
 CONTROL_NAMES = {"heartbeat", "worker.log", "worker.lock"}
 STATE_MARKERS = (".done", ".failed", ".running", ".ready")
+DELETE_MARKER = ".delete"
 MAX_LOG_BYTES = 200 * 1024
 SUBMIT_CHMOD = "Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw"
+NFS_RSYNC_FLAGS = ("--no-owner", "--no-group", "--no-perms", "--no-times")
 
 
 class TransportError(RuntimeError):
@@ -38,6 +39,25 @@ class JobSnapshot:
     submitted_at: float = 0.0
 
 
+class HeartbeatTracker:
+    def __init__(self, clock: Callable[[], float] | None = None):
+        self.clock = clock or time.monotonic
+        self.last_timestamp: str | None = None
+        self.last_progress_at: float | None = None
+
+    def observe(self, values: dict[str, str]) -> float | None:
+        timestamp = values.get("timestamp")
+        now = self.clock()
+        if not timestamp:
+            self.last_timestamp = None
+            self.last_progress_at = None
+            return None
+        if timestamp != self.last_timestamp or self.last_progress_at is None:
+            self.last_timestamp = timestamp
+            self.last_progress_at = now
+        return max(0.0, now - self.last_progress_at)
+
+
 def _read_text(path: Path, default: str = "") -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -45,8 +65,40 @@ def _read_text(path: Path, default: str = "") -> str:
         return default
 
 
+def _atomic_write_marker(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o666)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _marker_state(job_dir: Path) -> str:
-    for marker in STATE_MARKERS:
+    running = (job_dir / ".running").is_file()
+    deleting = (job_dir / DELETE_MARKER).is_file()
+    if running and deleting:
+        return "RUNNING"
+    if deleting:
+        return "DELETING"
+    for marker in (".done", ".failed", ".running", ".ready"):
         if (job_dir / marker).is_file():
             if marker == ".failed":
                 first_line = _read_text(job_dir / marker).splitlines()[:1]
@@ -58,7 +110,7 @@ def _marker_state(job_dir: Path) -> str:
 
 
 def _submitted_at(job_dir: Path, fallback: float) -> float:
-    for marker in STATE_MARKERS:
+    for marker in STATE_MARKERS + (DELETE_MARKER,):
         content = _read_text(job_dir / marker)
         for line in content.splitlines():
             if not line.startswith("submitted_at="):
@@ -75,7 +127,9 @@ def _submitted_at(job_dir: Path, fallback: float) -> float:
 
 def snapshot_job(job_dir: Path) -> JobSnapshot:
     mtimes = []
-    for path in (job_dir / name for name in STATE_MARKERS + ("exitcode", "log", "stderr.log")):
+    for path in (
+        job_dir / name for name in STATE_MARKERS + (DELETE_MARKER, "exitcode", "log", "stderr.log")
+    ):
         try:
             mtimes.append(path.stat().st_mtime)
         except FileNotFoundError:
@@ -129,15 +183,21 @@ def list_snapshots(root: Path) -> list[JobSnapshot]:
     )
 
 
-def worker_summary(root: Path, offline_after: float = 30.0) -> str:
+def worker_summary(
+    root: Path,
+    offline_after: float = 30.0,
+    tracker: HeartbeatTracker | None = None,
+) -> str:
     heartbeat = root / "heartbeat"
     values = parse_heartbeat(heartbeat)
     if not values:
+        if tracker is not None:
+            tracker.observe({})
         return "**Worker：🔴 OFFLINE**  · 未发现 heartbeat"
-    try:
-        age = max(0.0, time.time() - heartbeat.stat().st_mtime)
-    except (FileNotFoundError, OSError):
-        age = offline_after + 1
+    heartbeat_tracker = tracker or HeartbeatTracker()
+    age = heartbeat_tracker.observe(values)
+    if age is None:
+        return "**Worker：🔴 OFFLINE**  · heartbeat 没有有效 timestamp"
     state = "🟢 ONLINE" if age <= offline_after else "🔴 OFFLINE"
     current = values.get("current_job") or "空闲"
     server_time = values.get("iso_time") or values.get("timestamp") or "未知"
@@ -149,6 +209,9 @@ def worker_summary(root: Path, offline_after: float = 30.0) -> str:
 
 class FileTransport:
     read_only = False
+
+    def __init__(self):
+        self._heartbeat_tracker = HeartbeatTracker()
 
     def sync_metadata(self) -> None:
         raise NotImplementedError
@@ -173,11 +236,12 @@ class FileTransport:
         return tail_text(job_dir / "log"), tail_text(job_dir / "stderr.log")
 
     def health(self) -> str:
-        return worker_summary(self.root())
+        return worker_summary(self.root(), tracker=self._heartbeat_tracker)
 
 
 class LocalTransport(FileTransport):
     def __init__(self, root: Path):
+        super().__init__()
         self._root = root.expanduser().resolve()
 
     def root(self) -> Path:
@@ -201,13 +265,12 @@ class LocalTransport(FileTransport):
             raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
         if job_dir.exists() and job_dir.is_symlink():
             raise TransportError(f"任务目录不能是符号链接: {job_id}")
-        if job_dir.exists():
-            if not job_dir.is_dir():
-                raise TransportError(f"任务路径不是目录，拒绝删除: {job_id}")
-            shutil.rmtree(job_dir)
-        audit_copy = self._root / f"{job_id}.sh"
-        if audit_copy.exists() or audit_copy.is_symlink():
-            audit_copy.unlink()
+        if not job_dir.is_dir():
+            raise TransportError(f"任务不存在或不是目录: {job_id}")
+        _atomic_write_marker(
+            job_dir / DELETE_MARKER,
+            f"DELETE\nrequested_at={time.time():.6f}\n",
+        )
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -226,6 +289,7 @@ class RsyncTransport(FileTransport):
         ssh_port: int = 22,
         password: str | None = None,
     ):
+        super().__init__()
         self.remote = remote.rstrip("/")
         self._cache = cache.expanduser().resolve()
         self.runner = runner
@@ -274,45 +338,6 @@ class RsyncTransport(FileTransport):
                 )
         except (OSError, subprocess.CalledProcessError) as exc:
             raise TransportError(f"传输失败: {' '.join(args)}") from exc
-
-    def _ssh_command(self) -> list[str]:
-        command = [
-            "ssh",
-            "-p",
-            str(self.ssh_port),
-            "-o",
-            "ServerAliveInterval=30",
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPersist=60",
-            "-o",
-            "ControlPath=~/.ssh/pdshell-%C",
-        ]
-        if self.password_enabled:
-            command = ["sshpass", "-e", *command]
-        return command
-
-    def _run_remote(self, remote_command: str) -> None:
-        if not _is_remote_endpoint(self.remote):
-            raise TransportError("本地路径不支持远程 SSH 操作")
-        host, _remote_root = self.remote.split(":", 1)
-        args = self._ssh_command() + [host, "sh", "-c", remote_command]
-        try:
-            if self.runner is not None:
-                result = self.runner(args)
-                if result.returncode != 0:
-                    raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
-            else:
-                subprocess.run(
-                    args,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=self.environment,
-                )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            raise TransportError(f"远端操作失败: {' '.join(args)}") from exc
 
     def _job_exists(self, job_id: str) -> bool:
         args = self._rsync_command() + [
@@ -366,7 +391,9 @@ class RsyncTransport(FileTransport):
             "--include=.running",
             "--include=.done",
             "--include=.failed",
+            "--include=.delete",
             "--include=exitcode",
+            "--delete",
             "--exclude=*",
             self._remote(),
             str(self._cache) + "/",
@@ -384,9 +411,11 @@ class RsyncTransport(FileTransport):
             "--include=.running",
             "--include=.done",
             "--include=.failed",
+            "--include=.delete",
             "--include=exitcode",
             "--include=log",
             "--include=stderr.log",
+            "--delete",
             "--exclude=*",
             self._remote(f"{job_id}/"),
             str(destination) + "/",
@@ -403,34 +432,46 @@ class RsyncTransport(FileTransport):
     def delete_job(self, job_id: str) -> None:
         validate_job_id(job_id)
         if _is_remote_endpoint(self.remote):
+            if not self._job_exists(job_id):
+                raise TransportError(f"任务不存在，拒绝删除: {job_id}")
             self._sync_job(job_id, tolerate_errors=False)
-            if (self._cache / job_id / ".running").is_file():
-                raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
-            _host, remote_root = self.remote.split(":", 1)
-            remote_job = f"{remote_root.rstrip('/')}/{job_id}"
-            command = "rm -rf -- " + " ".join(
-                shlex.quote(path) for path in (remote_job, remote_job + ".sh")
-            )
-            self._run_remote(command)
+            remote_job_dir = None
         else:
-            job_dir = self._cache / job_id
-            if (job_dir / ".running").is_file():
+            remote_job_dir = Path(self.remote) / job_id
+            if (remote_job_dir / ".running").is_file():
                 raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
-            if job_dir.exists() and job_dir.is_symlink():
+            if remote_job_dir.exists() and remote_job_dir.is_symlink():
                 raise TransportError(f"任务目录不能是符号链接: {job_id}")
-            if job_dir.exists():
-                if not job_dir.is_dir():
-                    raise TransportError(f"任务路径不是目录，拒绝删除: {job_id}")
-                shutil.rmtree(job_dir)
-            audit_copy = self._cache / f"{job_id}.sh"
-            if audit_copy.exists() or audit_copy.is_symlink():
-                audit_copy.unlink()
+            if not remote_job_dir.is_dir():
+                raise TransportError(f"任务不存在或不是目录: {job_id}")
+
         cached_job = self._cache / job_id
-        if cached_job.exists() and not cached_job.is_symlink() and cached_job.is_dir():
-            shutil.rmtree(cached_job)
-        cached_audit = self._cache / f"{job_id}.sh"
-        if cached_audit.exists() or cached_audit.is_symlink():
-            cached_audit.unlink()
+        if (cached_job / ".running").is_file():
+            raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
+        cached_job.mkdir(parents=True, exist_ok=True)
+        marker_content = f"DELETE\nrequested_at={time.time():.6f}\n"
+        cached_marker = cached_job / DELETE_MARKER
+        _atomic_write_marker(cached_marker, marker_content)
+        if remote_job_dir is not None:
+            _atomic_write_marker(remote_job_dir / DELETE_MARKER, marker_content)
+        else:
+            try:
+                self._run(
+                    self._rsync_command()
+                    + [
+                        "-a",
+                        *NFS_RSYNC_FLAGS,
+                        f"--chmod={SUBMIT_CHMOD}",
+                        str(cached_marker),
+                        self._remote(f"{job_id}/{DELETE_MARKER}"),
+                    ]
+                )
+            except TransportError:
+                try:
+                    cached_marker.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
 
     def submit_script(self, script: Path, job_id: str | None = None) -> str:
         if job_id is None:
@@ -447,12 +488,19 @@ class RsyncTransport(FileTransport):
             ready.write_text(f"READY\nsubmitted_at={time.time():.6f}\n", encoding="utf-8")
             self._run(
                 self._rsync_command()
-                + ["-a", f"--chmod={SUBMIT_CHMOD}", str(script), self._remote(f"{job_id}.sh")]
+                + [
+                    "-a",
+                    *NFS_RSYNC_FLAGS,
+                    f"--chmod={SUBMIT_CHMOD}",
+                    str(script),
+                    self._remote(f"{job_id}.sh"),
+                ]
             )
             self._run(
                 self._rsync_command()
                 + [
                     "-a",
+                    *NFS_RSYNC_FLAGS,
                     f"--chmod={SUBMIT_CHMOD}",
                     "--exclude=.ready",
                     str(staging) + "/",
@@ -463,6 +511,7 @@ class RsyncTransport(FileTransport):
                 self._rsync_command()
                 + [
                     "-a",
+                    *NFS_RSYNC_FLAGS,
                     f"--chmod={SUBMIT_CHMOD}",
                     str(ready),
                     self._remote(f"{job_id}/.ready"),
@@ -482,6 +531,7 @@ class ScpTransport(FileTransport):
         ssh_port: int = 22,
         password: str | None = None,
     ):
+        super().__init__()
         self.remote = remote.rstrip("/")
         self._cache = cache.expanduser().resolve()
         self.runner = runner

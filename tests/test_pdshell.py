@@ -216,6 +216,46 @@ class PDShellIntegrationTest(unittest.TestCase):
         self.assertEqual(first_log.count("清理已有终态的重复 ready"), 1)
         self.assertEqual(second_log.count("清理已有终态的重复 ready"), 1)
 
+    def test_delete_marker_removes_ready_task_without_execution(self):
+        script = self.write_script(
+            "delete-before-run.sh", 'echo "$PDSHELL_JOB_ID" >> "$PDSHELL_ROOT/executions"\n'
+        )
+        self.submit(script, "delete-before-run")
+        job_dir = self.root / "delete-before-run"
+        (job_dir / ".delete").write_text("DELETE\n", encoding="utf-8")
+
+        self.run_worker_once()
+
+        self.assertFalse(job_dir.exists())
+        self.assertFalse((self.root / "delete-before-run.sh").exists())
+        self.assertFalse((self.root / "executions").exists())
+
+    def test_delete_marker_waits_for_running_task_then_cleans_up(self):
+        script = self.write_script("delete-after-run.sh", "sleep 0.1\n")
+        self.submit(script, "delete-after-run")
+        worker = subprocess.Popen(
+            [sys.executable, str(PDSHELL), "worker", "--root", str(self.root), "--poll-interval", "0.01"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            job_dir = self.root / "delete-after-run"
+            while not (job_dir / ".running").exists():
+                if time.monotonic() >= deadline:
+                    self.fail("Worker 未在 3 秒内领取任务")
+                time.sleep(0.01)
+            (job_dir / ".delete").write_text("DELETE\n", encoding="utf-8")
+            while job_dir.exists():
+                if time.monotonic() >= deadline:
+                    self.fail("Worker 未在任务结束后清理 delete marker")
+                time.sleep(0.01)
+        finally:
+            worker.terminate()
+            worker.communicate(timeout=3)
+        self.assertFalse((self.root / "delete-after-run.sh").exists())
+
     def test_invalid_ready_becomes_failed_once(self):
         job_dir = self.root / "invalid job"
         job_dir.mkdir(parents=True)

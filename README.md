@@ -17,6 +17,7 @@ $PDSHELL_ROOT/
 │   ├── .running             # RUNNING：Worker 原子领取
 │   ├── .done                # SUCCEEDED 终态
 │   ├── .failed              # FAILED 或 WORKER_LOST 终态
+│   ├── .delete              # 删除请求；由 Worker 执行清理
 │   ├── log                  # stdout
 │   ├── stderr.log           # stderr
 │   └── exitcode             # 退出码；WORKER_LOST 为 -1
@@ -25,14 +26,15 @@ $PDSHELL_ROOT/
 └── worker.lock              # 单 Worker flock
 ```
 
-同一时刻正常情况下每个任务目录只有一个状态文件。`.ready` 以及后续 marker 会保留 `submitted_at=<Unix 时间戳>`，供控制台按提交时间倒序展示；没有该字段的手工任务回退到目录更新时间。状态真相是 marker 文件名，而不是缓存快照：
+同一时刻正常情况下每个任务目录只有一个生命周期状态文件；`.delete` 是叠加的控制请求，不属于生命周期状态。`.ready` 以及后续 marker 会保留 `submitted_at=<Unix 时间戳>`，供控制台按提交时间倒序展示；没有该字段的手工任务回退到目录更新时间。状态真相是 marker 文件名，而不是缓存快照：
 
 ```text
 .ready → .running → .done
                   └→ .failed
+非 RUNNING 状态 ── .delete ──→ Worker 清理整个任务
 ```
 
-客户端推导状态时使用终态优先顺序：`.done` → `.failed` → `.running` → `.ready` → `INCOMPLETE`。`.failed` 的首行是 `FAILED` 或 `WORKER_LOST`。
+客户端推导状态时，`.running` 与 `.delete` 同时存在仍显示 `RUNNING`；其他状态只要存在 `.delete` 就显示 `DELETING`，否则使用 `.done` → `.failed` → `.running` → `.ready` → `INCOMPLETE`。`.failed` 的首行是 `FAILED` 或 `WORKER_LOST`。
 
 ## Worker
 
@@ -76,6 +78,8 @@ Worker 只执行 `<id>/run.sh`；根目录 `<id>.sh` 仅供审计和下载，不
 - 重启发现遗留 `.running` 时写入 `exitcode=-1` 和 `WORKER_LOST`，移动到 `.failed`，不重新执行。
 - 已有终态的重复 `.ready` 会被消费并只记录一次告警，不会重复执行或无限刷日志。
 - 非法任务 ID 的 `.ready` 会转成同目录 `.failed`，退出码为 `2`。
+- 前端删除只创建 `<id>/.delete`；Worker 不删除 RUNNING 任务，先删除审计副本再删除任务目录，目录删除失败时保留 marker 供下一轮重试。
+- READY 领取前后都会检查 `.delete`，避免删除请求把任务误推入执行；READY/终态任务删除后由 Worker 完成清理。
 - Worker 收到 SIGTERM/SIGINT 时终止任务进程组；约 10 秒后仍未退出则升级为 SIGKILL。
 - 平台停止宽限期建议至少 30 秒，并且只有在旧容器/cgroup 完全退出后才能启动替代 Worker。
 
@@ -95,6 +99,7 @@ export PDSHELL_SSH_PORT=22
 ./pdshell_client.sh status train-003
 ./pdshell_client.sh logs train-003 stdout
 ./pdshell_client.sh watch train-003
+./pdshell_client.sh delete train-003
 ```
 
 rsync 模式提交前会检查远端 `<id>/` 和 `<id>.sh`，任一已经存在就拒绝，覆盖 READY、RUNNING、终态以及没有 marker 的半提交任务。检查通过后按“审计脚本 → `run.sh` → `.ready`”顺序上传，并依赖 rsync 接收端临时文件加 rename。这个预检用于阻止常见的重复提交，不是跨客户端事务锁；多个客户端同时提交同一新 ID 仍属于不支持的竞争场景，应使用客户端生成的随机 ID。scp 模式是只读监控模式；提交按钮和 `submit` 命令会被禁用。当前 scp 模式为兼容性实现，会拉取远端任务目录，适合小规模监控；任务较多或日志较大时应使用 rsync。客户端使用本地缓存，不在仓库或界面保存 SSH 密码。
@@ -123,7 +128,7 @@ export PDSHELL_SSH_PORT=30901
 ./sync_to_server.sh
 ```
 
-同步后脚本会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
+同步时默认关闭 owner/group/perms/times 写入，适配 root-squash 或多 UID NFS；脚本随后会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。若仓库旁存在被 Git 忽略的 `env.sh`，同步脚本、Worker 入口和 Shell 客户端会自动加载它；`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
 
 集群连接参数可以放在仓库外的 `env.sh` 中，`env.sh` 已被 Git 和同步脚本排除；公开仓库只提供不含凭据的 [env.sh.example](env.sh.example) 模板。优先使用 SSH key，密码只从安全环境注入。
 
@@ -160,9 +165,9 @@ python3 frontend/app.py \
 
 Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可选 `PDSHELL_SSH_PASSWORD`。不传 `--endpoint` 时，本地模式默认使用仓库旁的 `tasks/`。Gradio 4.44–6.x 均以 `<7` 依赖范围支持；日志使用 Code 组件显示，兼容 Gradio 6 的交互行为。
 
-控制台每 2 秒刷新 heartbeat 和任务 marker，heartbeat 使用本地接收 mtime 判断在线状态，并额外展示 Worker 写入的服务器时间，避免前后端时钟偏差造成误判。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
+控制台每 2 秒刷新 heartbeat 和任务 marker。在线判断使用 heartbeat 内容中的远端 `timestamp` 是否推进，并用前端本地 monotonic 时钟计算距上次推进的时间，不依赖两台机器的绝对时钟或 rsync mtime；服务器写入的时间仍展示供人工核对。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
 
-提交区既支持上传 `.sh` 文件，也支持直接粘贴脚本。上传文件且任务 ID 留空时，默认使用“文件名去扩展名 + `YYYYMMDD-HHMMSS`”；手填 ID 优先。任务表按提交时间从新到旧显示，最右侧显示删除操作；先选中任务、勾选确认，再点击删除。删除会同时移除远端任务目录和 `<id>.sh` 审计副本，并拒绝删除 `.running` 任务；scp 只读模式不提供提交和删除。
+提交区既支持上传 `.sh` 文件，也支持直接粘贴脚本。上传文件且任务 ID 留空时，默认使用“文件名去扩展名 + `YYYYMMDD-HHMMSS`”；手填 ID 优先。任务表按提交时间从新到旧显示，最右侧显示删除操作；先选中任务、勾选确认，再点击删除。删除只发布 `<id>/.delete`，列表先显示 `DELETING`，由 Worker 清理远端任务目录和 `<id>.sh` 审计副本，并拒绝删除 `.running` 任务；scp 只读模式不提供提交和删除。
 
 ## Docker 接入
 
@@ -181,7 +186,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 
 ## 验证状态
 
-当前本地动态验证包含 32 项测试，覆盖：
+当前本地动态验证包含 35 项测试，覆盖：
 
 - v2 任务目录成功/失败闭环、纯文件提交、20 个批量任务串行执行。
 - 单 marker、审计副本、缺脚本、重复 ID、非法 ID、旧布局拒绝。
@@ -189,9 +194,10 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 - rsync 本地提交与缓存同步、scp 只读限制、日志尾部截断和 Shell 客户端闭环。
 - 非 22 SSH 端口、sshpass 参数脱敏、任意工作目录入口启动和环境变量默认根目录。
 - rsync 重复 ID 预检覆盖 READY、RUNNING、终态、半提交目录和审计副本；预检传输错误不会按“不存在”放行。
-- NFS 多 UID 文件权限、heartbeat mtime 在线判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
+- NFS 多 UID 文件权限、timestamp + monotonic heartbeat 在线判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
 - 工程同步排除运行数据、脚本执行权限和全仓库 LF 行尾检查。
 - Gradio 粘贴脚本、上传文件名任务 ID、提交时间排序和任务删除安全闸门。
+- Worker 代删、READY/DELETE 竞争保护、DELETING 状态、CLI 删除命令和 rsync 缓存清理。
 
 运行测试：
 

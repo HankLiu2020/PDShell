@@ -2,6 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/env.sh"
+fi
 DEPLOY_TARGET=${PDSHELL_DEPLOY_TARGET:-}
 REMOTE_PROJECT_DIR=${PDSHELL_REMOTE_PROJECT_DIR:-}
 SSH_HOST=${PDSHELL_SSH_HOST:-}
@@ -76,6 +80,10 @@ else
 fi
 
 run_rsync -az \
+    --no-owner \
+    --no-group \
+    --no-perms \
+    --no-times \
     --exclude='.git/' \
     --exclude='tasks/' \
     --exclude='.pdshell-cache/' \

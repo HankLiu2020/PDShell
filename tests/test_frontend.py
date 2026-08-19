@@ -2,7 +2,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -14,6 +13,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 from frontend.app import _suggest_job_id, _table_rows, submit_source
 from frontend.transport import (
+    HeartbeatTracker,
     LocalTransport,
     RsyncTransport,
     ScpTransport,
@@ -177,7 +177,7 @@ class FrontendTransportTest(unittest.TestCase):
             ("done-job", "SUCCEEDED"),
         ])
 
-    def test_local_delete_removes_task_and_audit_but_rejects_running(self):
+    def test_local_delete_publishes_marker_and_worker_removes_task(self):
         root = self.base / "tasks"
         root.mkdir()
         finished = root / "finished-job"
@@ -187,6 +187,14 @@ class FrontendTransportTest(unittest.TestCase):
         (root / "finished-job.sh").write_text("echo output\n", encoding="utf-8")
         transport = LocalTransport(root)
         transport.delete_job("finished-job")
+        self.assertTrue((finished / ".delete").is_file())
+
+        subprocess.run(
+            [sys.executable, str(PDSHELL), "worker", "--root", str(root), "--once"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         self.assertFalse(finished.exists())
         self.assertFalse((root / "finished-job.sh").exists())
 
@@ -197,11 +205,13 @@ class FrontendTransportTest(unittest.TestCase):
             transport.delete_job("running-job")
         self.assertTrue(running.exists())
 
-    def test_rsync_delete_uses_exact_remote_paths_and_rejects_password_argument(self):
+    def test_rsync_delete_uploads_marker_and_rejects_password_argument(self):
         calls = []
 
         def runner(args):
             calls.append(list(args))
+            if "--list-only" in args:
+                return subprocess.CompletedProcess(args, 0, "drwxr-xr-x 1 . safe-job\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         transport = RsyncTransport(
@@ -213,9 +223,24 @@ class FrontendTransportTest(unittest.TestCase):
         )
         transport.delete_job("safe-job")
         delete_call = calls[-1]
-        self.assertEqual(delete_call[:3], ["sshpass", "-e", "ssh"])
-        self.assertIn("rm -rf -- /persist/tasks/safe-job /persist/tasks/safe-job.sh", delete_call[-1])
+        self.assertEqual(delete_call[:3], ["sshpass", "-e", "rsync"])
+        self.assertTrue(delete_call[-1].endswith("/safe-job/.delete"))
+        self.assertNotIn("rm -rf", delete_call)
         self.assertNotIn("hidden-password", delete_call)
+
+    def test_delete_marker_is_deleting_unless_task_is_running(self):
+        root = self.base / "tasks"
+        done = root / "done-job"
+        done.mkdir(parents=True)
+        (done / ".done").write_text("SUCCEEDED\n", encoding="utf-8")
+        (done / ".delete").write_text("DELETE\n", encoding="utf-8")
+        running = root / "running-job"
+        running.mkdir(parents=True)
+        (running / ".running").write_text("RUNNING\n", encoding="utf-8")
+        (running / ".delete").write_text("DELETE\n", encoding="utf-8")
+        states = {item.job_id: item.state for item in list_snapshots(root)}
+        self.assertEqual(states["done-job"], "DELETING")
+        self.assertEqual(states["running-job"], "RUNNING")
 
     def test_submit_source_supports_paste_and_filename_timestamp_id(self):
         root = self.base / "tasks"
@@ -231,7 +256,7 @@ class FrontendTransportTest(unittest.TestCase):
         self.assertEqual(_suggest_job_id(str(upload), "manual-id"), "manual-id")
         self.assertIn("🗑️ 删除", _table_rows(list_snapshots(root))[-1])
 
-    def test_worker_summary_uses_received_heartbeat_mtime(self):
+    def test_worker_summary_uses_timestamp_progress_and_monotonic_age(self):
         root = self.base / "tasks"
         root.mkdir()
         heartbeat = root / "heartbeat"
@@ -239,14 +264,13 @@ class FrontendTransportTest(unittest.TestCase):
             "timestamp=1\niso_time=2026-08-14T10:00:00+0800\ncurrent_job=job-1\n",
             encoding="utf-8",
         )
-        now = time.time()
-        os.utime(heartbeat, (now, now))
-        online = worker_summary(root)
+        clock = iter([100.0, 105.0, 131.0]).__next__
+        tracker = HeartbeatTracker(clock=clock)
+        online = worker_summary(root, tracker=tracker)
         self.assertIn("🟢 ONLINE", online)
         self.assertIn("2026-08-14T10:00:00+0800", online)
-        old = now - 31
-        os.utime(heartbeat, (old, old))
-        self.assertIn("🔴 OFFLINE", worker_summary(root))
+        self.assertIn("🟢 ONLINE", worker_summary(root, tracker=tracker))
+        self.assertIn("🔴 OFFLINE", worker_summary(root, tracker=tracker))
 
 
 class ShellClientTest(unittest.TestCase):
@@ -318,6 +342,24 @@ class ShellClientTest(unittest.TestCase):
         )
         self.assertIn("client-output", logs.stdout)
 
+        delete = subprocess.run(
+            [str(CLIENT), "delete", "client-job"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertIn("已提交删除请求", delete.stdout)
+        self.assertTrue((remote / "client-job" / ".delete").is_file())
+        subprocess.run(
+            [sys.executable, str(PDSHELL), "worker", "--root", str(remote), "--once"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertFalse((remote / "client-job").exists())
+        self.assertFalse((remote / "client-job.sh").exists())
+
     def test_shell_client_rejects_incomplete_remote_job(self):
         remote = self.base / "tasks"
         incomplete = remote / "partial-job"
@@ -360,7 +402,11 @@ class ShellClientTest(unittest.TestCase):
         self.assertFalse((destination / ".git").exists())
         self.assertFalse((destination / "tasks").exists())
         self.assertEqual(last_sync.read_text(encoding="utf-8").strip(), str(destination))
-        self.assertIn("--exclude='env.sh'", SYNC_TO_SERVER.read_text(encoding="utf-8"))
+        sync_script = SYNC_TO_SERVER.read_text(encoding="utf-8")
+        self.assertIn("--exclude='env.sh'", sync_script)
+        for flag in ("--no-owner", "--no-group", "--no-perms", "--no-times"):
+            self.assertIn(flag, sync_script)
+        self.assertIn('source "$SCRIPT_DIR/env.sh"', sync_script)
 
     def test_tracked_text_files_use_lf_line_endings(self):
         tracked = subprocess.run(
