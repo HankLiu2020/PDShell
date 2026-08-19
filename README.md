@@ -78,7 +78,7 @@ Worker 只执行 `<id>/run.sh`；根目录 `<id>.sh` 仅供审计和下载，不
 - 重启发现遗留 `.running` 时写入 `exitcode=-1` 和 `WORKER_LOST`，移动到 `.failed`，不重新执行。
 - 已有终态的重复 `.ready` 会被消费并只记录一次告警，不会重复执行或无限刷日志。
 - 非法任务 ID 的 `.ready` 会转成同目录 `.failed`，退出码为 `2`。
-- 前端删除只创建 `<id>/.delete`；Worker 不删除 RUNNING 任务，先删除审计副本再删除任务目录，目录删除失败时保留 marker 供下一轮重试。
+- 前端删除只创建 `<id>/.delete`，内容包含 `DELETE`、`job_id` 和 `requested_at`；Worker 不删除 RUNNING 任务，先删除审计副本再删除任务目录，目录删除失败时保留 marker 供下一轮重试。
 - READY 领取前后都会检查 `.delete`，避免删除请求把任务误推入执行；READY/终态任务删除后由 Worker 完成清理。
 - Worker 收到 SIGTERM/SIGINT 时终止任务进程组；约 10 秒后仍未退出则升级为 SIGKILL。
 - 平台停止宽限期建议至少 30 秒，并且只有在旧容器/cgroup 完全退出后才能启动替代 Worker。
@@ -120,7 +120,7 @@ export PDSHELL_SSH_PASSWORD='从安全环境注入，不要写进脚本或 Git'
 
 ## 同步到服务器
 
-`sync_to_server.sh` 可把工程同步到普通 Linux 服务器，同时排除 `.git/`、`tasks/`、缓存、`.env` 和同步记录：
+`sync_to_server.sh` 可把工程同步到普通 Linux 服务器，同时排除 `.git/`、`tasks/`、缓存、`.env`、压缩包、合并日志、前端日志和同步记录：
 
 ```bash
 export PDSHELL_DEPLOY_TARGET=user@host:/path/to/PDShell
@@ -131,6 +131,8 @@ export PDSHELL_SSH_PORT=30901
 同步时默认关闭 owner/group/perms/times 写入，适配 root-squash 或多 UID NFS；脚本随后会修复 `docker-entrypoint.sh`、`pdshell.py` 和 `pdshell_client.sh` 的执行权限，并打印服务器端 `nohup` 启动提示。若仓库旁存在被 Git 忽略的 `env.sh`，同步脚本、Worker 入口和 Shell 客户端会自动加载它；`.last_sync_target` 只是本地运行缓存，已被 Git 忽略。
 
 集群连接参数可以放在仓库外的 `env.sh` 中，`env.sh` 已被 Git 和同步脚本排除；公开仓库只提供不含凭据的 [env.sh.example](env.sh.example) 模板。优先使用 SSH key，密码只从安全环境注入。
+
+三个 Shell 入口统一采用“进程环境变量 > `env.sh` > 默认值”的优先级；例如 `PDSHELL_DEPLOY_TARGET=A ./sync_to_server.sh` 不会被 `env.sh` 中的旧目标覆盖。
 
 ## NFS 多用户权限
 
@@ -165,9 +167,13 @@ python3 frontend/app.py \
 
 Gradio 与 Shell 客户端共用 `PDSHELL_SSH_*`、`PDSHELL_REMOTE_ROOT` 和可选 `PDSHELL_SSH_PASSWORD`。不传 `--endpoint` 时，本地模式默认使用仓库旁的 `tasks/`。Gradio 4.44–6.x 均以 `<7` 依赖范围支持；日志使用 Code 组件显示，兼容 Gradio 6 的交互行为。
 
-控制台每 2 秒刷新 heartbeat 和任务 marker。在线判断使用 heartbeat 内容中的远端 `timestamp` 是否推进，并用前端本地 monotonic 时钟计算距上次推进的时间，不依赖两台机器的绝对时钟或 rsync mtime；服务器写入的时间仍展示供人工核对。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
+控制台每 2 秒刷新 heartbeat 和任务 marker。在线判断使用 heartbeat 内容中的远端 `timestamp` 是否推进，并用前端本地 monotonic 时钟计算距上次推进的时间，不依赖两台机器的绝对时钟或 rsync mtime；服务器写入的时间仍展示供人工核对。选中任务后一次 rsync 拉取该任务目录，SSH 使用 ControlMaster 复用连接；metadata 同步另外读取远端任务目录清单，清理已经消失的本地任务缓存，但不会用 `--delete-excluded` 清空仍存在任务的日志。同步失败时继续显示已有缓存，不让整个表格刷新崩溃。界面只渲染日志末尾约 200 KB，完整内容保留在本地缓存。heartbeat 超过 30 秒显示 OFFLINE，但不会替远端任务修改状态。Gradio 默认只绑定 `127.0.0.1`，不启用公开分享链接。
 
-提交区既支持上传 `.sh` 文件，也支持直接粘贴脚本。上传文件且任务 ID 留空时，默认使用“文件名去扩展名 + `YYYYMMDD-HHMMSS`”；手填 ID 优先。任务表按提交时间从新到旧显示，最右侧显示删除操作；先选中任务、勾选确认，再点击删除。删除只发布 `<id>/.delete`，列表先显示 `DELETING`，由 Worker 清理远端任务目录和 `<id>.sh` 审计副本，并拒绝删除 `.running` 任务；scp 只读模式不提供提交和删除。
+提交区既支持上传 `.sh` 文件，也支持直接粘贴脚本。上传文件且任务 ID 留空时，默认使用“文件名去扩展名 + `YYYYMMDD-HHMMSS`”；手填 ID 优先。任务表按提交时间从新到旧显示四列：任务 ID、状态、退出码、更新时间。选中任务后直接点击底部删除按钮；删除只发布 `<id>/.delete`，列表先显示 `DELETING`，由 Worker 清理远端任务目录和 `<id>.sh` 审计副本，并拒绝删除 `.running` 任务；scp 只读模式不提供提交和删除。
+
+heartbeat 第一次被前端观察到时显示 `DETECTING`，只有下一次 timestamp 真正推进后才显示 `ONLINE`；timestamp 在 30 秒内不推进则显示 `OFFLINE`。这样前端刚启动时不会把遗留的旧 heartbeat 立即误判为在线。
+
+仓库还提供三个不依赖远端 HTTP 的辅助脚本：`env_probe.sh` 打印脱敏后的连接、路径、工具和 GPU 环境；`gpu_test.sh` 检查 `nvidia-smi` 与 PyTorch CUDA 可见性；`start_frontend.sh` 从任意工作目录加载环境并启动本地 Gradio。
 
 ## Docker 接入
 
@@ -186,7 +192,7 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 
 ## 验证状态
 
-当前本地动态验证包含 35 项测试，覆盖：
+当前本地动态验证包含 40 项测试，覆盖：
 
 - v2 任务目录成功/失败闭环、纯文件提交、20 个批量任务串行执行。
 - 单 marker、审计副本、缺脚本、重复 ID、非法 ID、旧布局拒绝。
@@ -194,17 +200,18 @@ Docker 镜像、PID 1、cgroup、GPU runtime、OOM、bind mount 和宿主机重�
 - rsync 本地提交与缓存同步、scp 只读限制、日志尾部截断和 Shell 客户端闭环。
 - 非 22 SSH 端口、sshpass 参数脱敏、任意工作目录入口启动和环境变量默认根目录。
 - rsync 重复 ID 预检覆盖 READY、RUNNING、终态、半提交目录和审计副本；预检传输错误不会按“不存在”放行。
-- NFS 多 UID 文件权限、timestamp + monotonic heartbeat 在线判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
+- NFS 多 UID 文件权限、timestamp + monotonic heartbeat 的 DETECTING/ONLINE/OFFLINE 判断、服务器时间展示、一次任务目录同步和 SSH ControlMaster 参数。
 - 工程同步排除运行数据、脚本执行权限和全仓库 LF 行尾检查。
-- Gradio 粘贴脚本、上传文件名任务 ID、提交时间排序和任务删除安全闸门。
+- Gradio 粘贴脚本、上传文件名任务 ID、提交时间排序和四列任务删除操作。
 - Worker 代删、READY/DELETE 竞争保护、DELETING 状态、CLI 删除命令和 rsync 缓存清理。
+- 删除后 metadata cache 清理、env.sh 显式环境变量优先级、辅助脚本和公开配置模板检查。
 
 运行测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile pdshell.py frontend/transport.py frontend/app.py
-bash -n docker-entrypoint.sh pdshell_client.sh sync_to_server.sh env.sh.example
+bash -n docker-entrypoint.sh pdshell_client.sh sync_to_server.sh env_probe.sh gpu_test.sh start_frontend.sh env.sh.example
 ```
 
 仓库通过 `.gitattributes` 强制 Python、Shell、Markdown 和 Dockerfile 使用 LF，避免 Windows/IDE 的 CRLF 转换制造整文件伪 diff。

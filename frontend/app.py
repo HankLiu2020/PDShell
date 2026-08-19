@@ -42,7 +42,7 @@ def _format_updated(snapshot: JobSnapshot) -> str:
 
 def _table_rows(snapshots: list[JobSnapshot]) -> list[list[str]]:
     return [
-        [item.job_id, item.state, item.exitcode or "-", _format_updated(item), "🗑️ 删除"]
+        [item.job_id, item.state, item.exitcode or "-", _format_updated(item)]
         for item in snapshots
     ]
 
@@ -147,7 +147,7 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
         except (OSError, ValueError, TransportError) as exc:
             return f"❌ 提交失败：`{exc}`"
 
-    def delete_selected(job_id: str, confirmed: bool):
+    def delete_selected(job_id: str):
         if transport.read_only:
             stdout, stderr = transport.logs(job_id) if job_id else ("", "")
             return (
@@ -158,7 +158,6 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 f"### 任务日志：{job_id or '未选择'}",
                 stdout,
                 stderr,
-                confirmed,
             )
         if not job_id:
             return (
@@ -169,19 +168,6 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 "### 任务日志：未选择",
                 "",
                 "",
-                confirmed,
-            )
-        if not confirmed:
-            stdout, stderr = transport.logs(job_id)
-            return (
-                "⚠️ 删除不可恢复，请先勾选确认框。",
-                job_id,
-                transport.health(),
-                _table_rows(transport.snapshots()),
-                f"### 任务日志：{job_id}",
-                stdout,
-                stderr,
-                confirmed,
             )
         try:
             transport.delete_job(job_id)
@@ -195,7 +181,6 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 f"### 任务日志：{job_id}",
                 stdout,
                 stderr,
-                confirmed,
             )
         return (
             f"✅ 已提交删除请求 `{job_id}`；Worker 将清理任务目录和审计脚本。",
@@ -205,7 +190,6 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
             "### 任务日志：未选择",
             "",
             "",
-            False,
         )
 
     with gr.Blocks(title="PDShell") as demo:
@@ -227,17 +211,12 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                 health = gr.Markdown("正在读取 Worker 状态…")
                 refresh_button = gr.Button("立即刷新")
                 table = gr.Dataframe(
-                    headers=["任务 ID", "状态", "退出码", "更新时间", "操作"],
-                    datatype=["str", "str", "str", "str", "str"],
+                    headers=["任务 ID", "状态", "退出码", "更新时间"],
+                    datatype=["str", "str", "str", "str"],
                     value=[],
                     row_count=0,
                     interactive=False,
                     wrap=True,
-                )
-                delete_confirm = gr.Checkbox(
-                    label="确认删除选中的任务（不可恢复）",
-                    value=False,
-                    interactive=not transport.read_only,
                 )
                 delete_button = gr.Button(
                     "🗑️ 删除选中任务",
@@ -245,7 +224,7 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
                     interactive=not transport.read_only,
                 )
                 delete_status = gr.Markdown(
-                    "scp 模式为只读，删除按钮已禁用。" if transport.read_only else "先点击任务行，再确认删除。"
+                    "scp 模式为只读，删除按钮已禁用。" if transport.read_only else "先点击任务行，再点击删除按钮。"
                 )
             with gr.Column(scale=2, min_width=500):
                 log_header = gr.Markdown("### 任务日志：未选择")
@@ -260,8 +239,8 @@ def build_demo(transport: FileTransport, poll_interval: float = 2.0):
         table.select(select_job, inputs=[], outputs=[selected_job, log_header, stdout, stderr])
         delete_button.click(
             delete_selected,
-            inputs=[selected_job, delete_confirm],
-            outputs=[delete_status, selected_job, health, table, log_header, stdout, stderr, delete_confirm],
+            inputs=[selected_job],
+            outputs=[delete_status, selected_job, health, table, log_header, stdout, stderr],
         )
         refresh_button.click(refresh, inputs=[selected_job], outputs=[health, table, log_header, stdout, stderr])
         if hasattr(gr, "Timer"):

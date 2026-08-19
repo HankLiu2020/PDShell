@@ -2,10 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/env.sh"
-fi
+
+load_private_env() {
+    local name index
+    local -a explicit_names=() explicit_values=()
+    for name in PDSHELL_REMOTE PDSHELL_REMOTE_ROOT PDSHELL_SSH_HOST PDSHELL_SSH_USER \
+        PDSHELL_SSH_PORT PDSHELL_SSH_PASSWORD PDSHELL_TRANSPORT PDSHELL_CACHE PDSHELL_POLL_INTERVAL; do
+        if declare -p "$name" >/dev/null 2>&1; then
+            explicit_names+=("$name")
+            explicit_values+=("${!name}")
+        fi
+    done
+    if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/env.sh"
+    fi
+    for index in "${!explicit_names[@]}"; do
+        printf -v "${explicit_names[index]}" '%s' "${explicit_values[index]}"
+        export "${explicit_names[index]}"
+    done
+}
+
+load_private_env
+unset -f load_private_env
 
 REMOTE=${PDSHELL_REMOTE:-}
 REMOTE_ROOT=${PDSHELL_REMOTE_ROOT:-}
@@ -140,12 +159,49 @@ sync_metadata() {
             --delete \
             --exclude='*' \
             "$(remote_path '')" "$CACHE/"
+        prune_cache_jobs
     elif [[ "$MODE" == "scp" ]]; then
         run_scp -q -r "$(remote_path '.')" "$CACHE"
     else
         printf '不支持的传输模式: %s\n' "$MODE" >&2
         return 2
     fi
+}
+
+prune_cache_jobs() {
+    [[ "$MODE" == "rsync" ]] || return 0
+    local listing
+    if ! listing=$(run_rsync --list-only --include='*/' --exclude='*' "$(remote_path '')" 2>/dev/null); then
+        return 0
+    fi
+    shopt -s nullglob
+    local job_dir job_id line remote_job root_seen=1
+    while IFS= read -r line; do
+        remote_job=${line##* }
+        if [[ "$remote_job" == "." ]]; then
+            root_seen=0
+            break
+        fi
+    done <<< "$listing"
+    [[ "$root_seen" -eq 0 ]] || return 0
+    for job_dir in "$CACHE"/*; do
+        [[ -d "$job_dir" && ! -L "$job_dir" ]] || continue
+        job_id=$(basename "$job_dir")
+        [[ "$job_id" == .* ]] && continue
+        [[ "$job_id" == "heartbeat" || "$job_id" == "worker.log" || "$job_id" == "worker.lock" ]] && continue
+        local found=1
+        while IFS= read -r line; do
+            remote_job=${line##* }
+            [[ "$remote_job" == "." || "$remote_job" == ".." ]] && continue
+            if [[ "$remote_job" == "$job_id" ]]; then
+                found=0
+                break
+            fi
+        done <<< "$listing"
+        if [[ "$found" -ne 0 ]]; then
+            rm -rf -- "$job_dir"
+        fi
+    done
 }
 
 sync_job() {
@@ -288,7 +344,7 @@ delete_job() {
     local staging
     staging=$(mktemp -d "${TMPDIR:-/tmp}/pdshell-delete.XXXXXX")
     trap 'rm -rf "$staging"' RETURN
-    printf 'DELETE\nrequested_at=%s\n' "$(date +%s)" > "$staging/.delete"
+    printf 'DELETE\njob_id=%s\nrequested_at=%s\n' "$job_id" "$(date +%s)" > "$staging/.delete"
     run_rsync -a --chmod=Du=rwx,Dgo=rwx,Fu=rw,Fgo=rw \
         "$staging/.delete" "$(remote_path "$job_id/.delete")"
     mkdir -p "$CACHE/$job_id"

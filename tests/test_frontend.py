@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,32 @@ class FrontendTransportTest(unittest.TestCase):
         stdout, stderr = transport.logs(job_id)
         self.assertIn("frontend-output", stdout)
         self.assertEqual(stderr, "")
+
+    def test_metadata_sync_prunes_deleted_job_cache_without_deleting_live_logs(self):
+        remote = self.base / "remote"
+        cache = self.base / "cache"
+        remote.mkdir()
+        transport = RsyncTransport(str(remote), cache)
+        job_id = transport.submit_script(self.write_script(), "cache-delete-job")
+        subprocess.run(
+            [sys.executable, str(PDSHELL), "worker", "--root", str(remote), "--once"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        transport.sync_job(job_id)
+        self.assertTrue((cache / job_id / "log").is_file())
+
+        transport.delete_job(job_id)
+        subprocess.run(
+            [sys.executable, str(PDSHELL), "worker", "--root", str(remote), "--once"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertFalse((remote / job_id).exists())
+        transport.sync_metadata()
+        self.assertFalse((cache / job_id).exists())
 
     def test_tail_text_limits_rendered_log(self):
         log = self.base / "large.log"
@@ -188,6 +215,10 @@ class FrontendTransportTest(unittest.TestCase):
         transport = LocalTransport(root)
         transport.delete_job("finished-job")
         self.assertTrue((finished / ".delete").is_file())
+        self.assertEqual(
+            (finished / ".delete").read_text(encoding="utf-8").splitlines()[1],
+            "job_id=finished-job",
+        )
 
         subprocess.run(
             [sys.executable, str(PDSHELL), "worker", "--root", str(root), "--once"],
@@ -254,7 +285,9 @@ class FrontendTransportTest(unittest.TestCase):
         suggested = _suggest_job_id(str(upload))
         self.assertRegex(suggested, r"^camera-train-\d{8}-\d{6}$")
         self.assertEqual(_suggest_job_id(str(upload), "manual-id"), "manual-id")
-        self.assertIn("🗑️ 删除", _table_rows(list_snapshots(root))[-1])
+        rows = _table_rows(list_snapshots(root))
+        self.assertEqual(len(rows[-1]), 4)
+        self.assertNotIn("🗑️ 删除", rows[-1])
 
     def test_worker_summary_uses_timestamp_progress_and_monotonic_age(self):
         root = self.base / "tasks"
@@ -264,13 +297,23 @@ class FrontendTransportTest(unittest.TestCase):
             "timestamp=1\niso_time=2026-08-14T10:00:00+0800\ncurrent_job=job-1\n",
             encoding="utf-8",
         )
-        clock = iter([100.0, 105.0, 131.0]).__next__
+        clock = iter([100.0, 105.0, 106.0, 140.0]).__next__
         tracker = HeartbeatTracker(clock=clock)
-        online = worker_summary(root, tracker=tracker)
-        self.assertIn("🟢 ONLINE", online)
-        self.assertIn("2026-08-14T10:00:00+0800", online)
+        detecting = worker_summary(root, tracker=tracker)
+        self.assertIn("🟡 DETECTING", detecting)
+        self.assertIn("2026-08-14T10:00:00+0800", detecting)
+        self.assertIn("🟡 DETECTING", worker_summary(root, tracker=tracker))
+        heartbeat.write_text(
+            "timestamp=2\niso_time=2026-08-14T10:00:01+0800\ncurrent_job=job-1\n",
+            encoding="utf-8",
+        )
         self.assertIn("🟢 ONLINE", worker_summary(root, tracker=tracker))
         self.assertIn("🔴 OFFLINE", worker_summary(root, tracker=tracker))
+
+        stale_clock = iter([200.0, 231.0]).__next__
+        stale_tracker = HeartbeatTracker(clock=stale_clock)
+        self.assertIn("🟡 DETECTING", worker_summary(root, tracker=stale_tracker))
+        self.assertIn("🔴 OFFLINE", worker_summary(root, tracker=stale_tracker))
 
 
 class ShellClientTest(unittest.TestCase):
@@ -351,6 +394,7 @@ class ShellClientTest(unittest.TestCase):
         )
         self.assertIn("已提交删除请求", delete.stdout)
         self.assertTrue((remote / "client-job" / ".delete").is_file())
+        self.assertIn("job_id=client-job", (remote / "client-job" / ".delete").read_text())
         subprocess.run(
             [sys.executable, str(PDSHELL), "worker", "--root", str(remote), "--once"],
             check=True,
@@ -359,6 +403,15 @@ class ShellClientTest(unittest.TestCase):
         )
         self.assertFalse((remote / "client-job").exists())
         self.assertFalse((remote / "client-job.sh").exists())
+        listed_after_delete = subprocess.run(
+            [str(CLIENT), "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertIn("JOB_ID\tSTATE\tEXITCODE", listed_after_delete.stdout)
+        self.assertFalse((self.base / "cache" / "client-job").exists())
 
     def test_shell_client_rejects_incomplete_remote_job(self):
         remote = self.base / "tasks"
@@ -383,6 +436,33 @@ class ShellClientTest(unittest.TestCase):
         self.assertIn("任务 ID 已存在", result.stderr)
         self.assertEqual((incomplete / "run.sh").read_text(), "echo original\n")
 
+    def test_shell_client_process_environment_overrides_env_file(self):
+        client_dir = self.base / "client-copy"
+        client_dir.mkdir()
+        client_copy = client_dir / "pdshell_client.sh"
+        shutil.copy2(CLIENT, client_copy)
+        env_remote = self.base / "env-remote"
+        explicit_remote = self.base / "explicit-remote"
+        explicit_remote.mkdir()
+        (client_dir / "env.sh").write_text(
+            f"export PDSHELL_REMOTE={env_remote}\nexport PDSHELL_TRANSPORT=rsync\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(client_copy), "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ
+            | {
+                "PDSHELL_REMOTE": str(explicit_remote),
+                "PDSHELL_TRANSPORT": "rsync",
+                "PDSHELL_CACHE": str(self.base / "cache"),
+            },
+        )
+        self.assertIn("JOB_ID\tSTATE\tEXITCODE", result.stdout)
+        self.assertFalse(env_remote.exists())
+
     def test_project_sync_excludes_runtime_and_repository_data(self):
         destination = self.base / "deployed"
         last_sync = self.base / "last-sync-target"
@@ -399,6 +479,8 @@ class ShellClientTest(unittest.TestCase):
         )
         self.assertTrue((destination / "pdshell.py").is_file())
         self.assertTrue(os.access(destination / "docker-entrypoint.sh", os.X_OK))
+        for helper in ("env_probe.sh", "gpu_test.sh", "start_frontend.sh"):
+            self.assertTrue(os.access(destination / helper, os.X_OK))
         self.assertFalse((destination / ".git").exists())
         self.assertFalse((destination / "tasks").exists())
         self.assertEqual(last_sync.read_text(encoding="utf-8").strip(), str(destination))
@@ -407,6 +489,53 @@ class ShellClientTest(unittest.TestCase):
         for flag in ("--no-owner", "--no-group", "--no-perms", "--no-times"):
             self.assertIn(flag, sync_script)
         self.assertIn('source "$SCRIPT_DIR/env.sh"', sync_script)
+        for pattern in ("--exclude='*.zip'", "--exclude='MERGE_LOG_*.md'", "--exclude='frontend.log'"):
+            self.assertIn(pattern, sync_script)
+
+    def test_explicit_deploy_target_overrides_ignored_env_file(self):
+        script_dir = self.base / "sync-script"
+        script_dir.mkdir()
+        script_copy = script_dir / "sync_to_server.sh"
+        shutil.copy2(SYNC_TO_SERVER, script_copy)
+        for name in (
+            "docker-entrypoint.sh",
+            "pdshell.py",
+            "pdshell_client.sh",
+            "env_probe.sh",
+            "gpu_test.sh",
+            "start_frontend.sh",
+        ):
+            shutil.copy2(PROJECT_DIR / name, script_dir / name)
+        (script_dir / "env.sh").write_text(
+            "export PDSHELL_DEPLOY_TARGET=%s\n" % (self.base / "from-env"),
+            encoding="utf-8",
+        )
+        explicit_target = self.base / "explicit-target"
+        last_sync = self.base / "last-sync"
+        subprocess.run(
+            [str(script_copy)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ
+            | {
+                "PDSHELL_DEPLOY_TARGET": str(explicit_target),
+                "PDSHELL_LAST_SYNC_FILE": str(last_sync),
+            },
+        )
+        self.assertEqual(last_sync.read_text(encoding="utf-8").strip(), str(explicit_target))
+        self.assertFalse((self.base / "from-env").exists())
+
+    def test_auxiliary_scripts_are_executable_and_syntax_checked(self):
+        helpers = [PROJECT_DIR / name for name in ("env_probe.sh", "gpu_test.sh", "start_frontend.sh")]
+        subprocess.run(
+            ["bash", "-n", *(str(path) for path in helpers)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for helper in helpers:
+            self.assertTrue(os.access(helper, os.X_OK))
 
     def test_tracked_text_files_use_lf_line_endings(self):
         tracked = subprocess.run(

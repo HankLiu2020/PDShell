@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-umask 000
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 load_private_env() {
     local name index
     local -a explicit_names=() explicit_values=()
-    for name in PDSHELL_ROOT PDSHELL_POLL_INTERVAL; do
+    for name in PDSHELL_ROOT PDSHELL_ENDPOINT PDSHELL_REMOTE_ROOT PDSHELL_REMOTE \
+        PDSHELL_TRANSPORT PDSHELL_CACHE PDSHELL_POLL_INTERVAL PDSHELL_PORT \
+        PDSHELL_SSH_HOST PDSHELL_SSH_USER PDSHELL_SSH_PORT PDSHELL_SSH_PASSWORD; do
         if declare -p "$name" >/dev/null 2>&1; then
             explicit_names+=("$name")
             explicit_values+=("${!name}")
@@ -25,8 +26,6 @@ load_private_env() {
 
 load_private_env
 unset -f load_private_env
-PDSHELL_ROOT=${PDSHELL_ROOT:-"$SCRIPT_DIR/tasks"}
+export PDSHELL_CACHE=${PDSHELL_CACHE:-"$SCRIPT_DIR/.pdshell-cache"}
 
-exec python3 "$SCRIPT_DIR/pdshell.py" worker \
-  --root "$PDSHELL_ROOT" \
-  --poll-interval "${PDSHELL_POLL_INTERVAL:-1}"
+exec python3 "$SCRIPT_DIR/frontend/app.py" "$@"

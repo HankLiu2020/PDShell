@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+*.zip
+MERGE_LOG_*.md
+frontend.log
 .pdshell-cache/
 .ruff_cache/
 .last_sync_target

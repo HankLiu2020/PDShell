@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -332,6 +333,40 @@ class PDShellIntegrationTest(unittest.TestCase):
         self.assertEqual(worker.returncode, 0)
         self.assertEqual(stat.S_IMODE((entrypoint_root / "worker.log").stat().st_mode), 0o666)
         self.assertEqual(stat.S_IMODE((entrypoint_root / "worker.lock").stat().st_mode), 0o666)
+
+    def test_entrypoint_process_environment_overrides_env_file(self):
+        entrypoint_dir = Path(self.temp_dir.name) / "entrypoint-copy"
+        entrypoint_dir.mkdir()
+        shutil.copy2(ENTRYPOINT, entrypoint_dir / "docker-entrypoint.sh")
+        shutil.copy2(PDSHELL, entrypoint_dir / "pdshell.py")
+        env_root = Path(self.temp_dir.name) / "env-file-tasks"
+        explicit_root = Path(self.temp_dir.name) / "explicit-tasks"
+        (entrypoint_dir / "env.sh").write_text(
+            f"export PDSHELL_ROOT={env_root}\nexport PDSHELL_POLL_INTERVAL=0.2\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen(
+            [str(entrypoint_dir / "docker-entrypoint.sh")],
+            cwd=self.temp_dir.name,
+            env=os.environ
+            | {
+                "PDSHELL_ROOT": str(explicit_root),
+                "PDSHELL_POLL_INTERVAL": "0.02",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not (explicit_root / "heartbeat").exists():
+                if time.monotonic() >= deadline:
+                    self.fail("显式 PDSHELL_ROOT 未生效")
+                time.sleep(0.02)
+        finally:
+            worker.terminate()
+            worker.communicate(timeout=3)
+        self.assertFalse((env_root / "heartbeat").exists())
 
     def test_legacy_layout_is_rejected(self):
         (self.root / "inbox").mkdir(parents=True)
