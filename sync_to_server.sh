@@ -2,10 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/env.sh"
-fi
+
+load_private_env() {
+    local name index
+    local -a explicit_names=() explicit_values=()
+    for name in PDSHELL_DEPLOY_TARGET PDSHELL_REMOTE_PROJECT_DIR PDSHELL_SSH_HOST \
+        PDSHELL_SSH_USER PDSHELL_SSH_PORT PDSHELL_SSH_PASSWORD PDSHELL_LAST_SYNC_FILE; do
+        if declare -p "$name" >/dev/null 2>&1; then
+            explicit_names+=("$name")
+            explicit_values+=("${!name}")
+        fi
+    done
+    if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/env.sh"
+    fi
+    for index in "${!explicit_names[@]}"; do
+        printf -v "${explicit_names[index]}" '%s' "${explicit_values[index]}"
+        export "${explicit_names[index]}"
+    done
+}
+
+load_private_env
+unset -f load_private_env
 DEPLOY_TARGET=${PDSHELL_DEPLOY_TARGET:-}
 REMOTE_PROJECT_DIR=${PDSHELL_REMOTE_PROJECT_DIR:-}
 SSH_HOST=${PDSHELL_SSH_HOST:-}
@@ -93,13 +112,19 @@ run_rsync -az \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     --exclude='.DS_Store' \
+    --exclude='*.zip' \
+    --exclude='MERGE_LOG_*.md' \
+    --exclude='frontend.log' \
     "$SCRIPT_DIR/" "${DEPLOY_TARGET%/}/"
 
 if is_remote_target; then
-    printf -v chmod_command 'chmod +x %q %q %q' \
+    printf -v chmod_command 'chmod +x %q %q %q %q %q %q' \
         "$remote_dir/docker-entrypoint.sh" \
         "$remote_dir/pdshell.py" \
-        "$remote_dir/pdshell_client.sh"
+        "$remote_dir/pdshell_client.sh" \
+        "$remote_dir/env_probe.sh" \
+        "$remote_dir/gpu_test.sh" \
+        "$remote_dir/start_frontend.sh"
     run_ssh "$remote_host" "$chmod_command"
     printf '同步完成。服务器启动命令:\n'
     printf '  cd %q && nohup bash docker-entrypoint.sh > worker.nohup.log 2>&1 &\n' "$remote_dir"
@@ -107,7 +132,10 @@ else
     chmod +x \
         "$DEPLOY_TARGET/docker-entrypoint.sh" \
         "$DEPLOY_TARGET/pdshell.py" \
-        "$DEPLOY_TARGET/pdshell_client.sh"
+        "$DEPLOY_TARGET/pdshell_client.sh" \
+        "$DEPLOY_TARGET/env_probe.sh" \
+        "$DEPLOY_TARGET/gpu_test.sh" \
+        "$DEPLOY_TARGET/start_frontend.sh"
     printf '本地同步完成: %s\n' "$DEPLOY_TARGET"
 fi
 

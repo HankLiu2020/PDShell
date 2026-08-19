@@ -44,6 +44,7 @@ class HeartbeatTracker:
         self.clock = clock or time.monotonic
         self.last_timestamp: str | None = None
         self.last_progress_at: float | None = None
+        self.has_observed_progress = False
 
     def observe(self, values: dict[str, str]) -> float | None:
         timestamp = values.get("timestamp")
@@ -51,9 +52,14 @@ class HeartbeatTracker:
         if not timestamp:
             self.last_timestamp = None
             self.last_progress_at = None
+            self.has_observed_progress = False
             return None
-        if timestamp != self.last_timestamp or self.last_progress_at is None:
+        if timestamp != self.last_timestamp:
+            if self.last_timestamp is not None:
+                self.has_observed_progress = True
             self.last_timestamp = timestamp
+            self.last_progress_at = now
+        elif self.last_progress_at is None:
             self.last_progress_at = now
         return max(0.0, now - self.last_progress_at)
 
@@ -198,6 +204,10 @@ def worker_summary(
     age = heartbeat_tracker.observe(values)
     if age is None:
         return "**Worker：🔴 OFFLINE**  · heartbeat 没有有效 timestamp"
+    if not heartbeat_tracker.has_observed_progress:
+        if age > offline_after:
+            return f"**Worker：🔴 OFFLINE**  · 首次 heartbeat 后 {age:.1f}s 未推进  · 服务器时间：`{values.get('iso_time') or values.get('timestamp') or '未知'}`"
+        return f"**Worker：🟡 DETECTING**  · 首次 heartbeat，等待下一次推进  · 服务器时间：`{values.get('iso_time') or values.get('timestamp') or '未知'}`"
     state = "🟢 ONLINE" if age <= offline_after else "🔴 OFFLINE"
     current = values.get("current_job") or "空闲"
     server_time = values.get("iso_time") or values.get("timestamp") or "未知"
@@ -269,7 +279,7 @@ class LocalTransport(FileTransport):
             raise TransportError(f"任务不存在或不是目录: {job_id}")
         _atomic_write_marker(
             job_dir / DELETE_MARKER,
-            f"DELETE\nrequested_at={time.time():.6f}\n",
+            f"DELETE\njob_id={job_id}\nrequested_at={int(time.time())}\n",
         )
 
 
@@ -372,6 +382,74 @@ class RsyncTransport(FileTransport):
         }
         return bool(expected_names & listed_names)
 
+    def _remote_job_ids(self) -> set[str]:
+        if not _is_remote_endpoint(self.remote):
+            root = Path(self.remote)
+            try:
+                return {
+                    path.name
+                    for path in root.iterdir()
+                    if path.is_dir() and not path.name.startswith(".") and path.name not in CONTROL_NAMES
+                }
+            except OSError as exc:
+                raise TransportError(f"读取远端任务目录失败: {root}") from exc
+
+        args = self._rsync_command() + [
+            "--list-only",
+            "--include=*/",
+            "--exclude=*",
+            self._remote(),
+        ]
+        try:
+            if self.runner is not None:
+                result = self.runner(args)
+            else:
+                result = subprocess.run(
+                    args,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=self.environment,
+                )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise TransportError(f"读取远端任务目录失败: {' '.join(args)}") from exc
+        if result.returncode != 0:
+            raise TransportError(f"读取远端任务目录失败，rsync exitcode={result.returncode}")
+        job_ids = set()
+        root_seen = False
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            name = fields[-1].rstrip("/")
+            if name == ".":
+                root_seen = True
+            elif name not in {".."} and "/" not in name:
+                job_ids.add(name)
+        if not root_seen:
+            raise TransportError("远端任务目录清单不完整，保留现有缓存")
+        return job_ids
+
+    def _prune_cache_jobs(self) -> None:
+        remote_job_ids = self._remote_job_ids()
+        try:
+            cached_paths = list(self._cache.iterdir())
+        except OSError as exc:
+            raise TransportError(f"读取本地缓存失败: {self._cache}") from exc
+        for path in cached_paths:
+            if (
+                not path.is_dir()
+                or path.is_symlink()
+                or path.name.startswith(".")
+                or path.name in CONTROL_NAMES
+                or path.name in remote_job_ids
+            ):
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                raise TransportError(f"清理已删除任务缓存失败: {path}") from exc
+
     def sync_metadata(self) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
         heartbeat_args = self._rsync_command() + [
@@ -399,6 +477,7 @@ class RsyncTransport(FileTransport):
             str(self._cache) + "/",
         ]
         self._run(args)
+        self._prune_cache_jobs()
 
     def _sync_job(self, job_id: str, tolerate_errors: bool) -> None:
         self._cache.mkdir(parents=True, exist_ok=True)
@@ -449,7 +528,7 @@ class RsyncTransport(FileTransport):
         if (cached_job / ".running").is_file():
             raise TransportError(f"任务正在运行，拒绝删除: {job_id}")
         cached_job.mkdir(parents=True, exist_ok=True)
-        marker_content = f"DELETE\nrequested_at={time.time():.6f}\n"
+        marker_content = f"DELETE\njob_id={job_id}\nrequested_at={int(time.time())}\n"
         cached_marker = cached_job / DELETE_MARKER
         _atomic_write_marker(cached_marker, marker_content)
         if remote_job_dir is not None:
